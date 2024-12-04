@@ -28,11 +28,12 @@ class OrderRequest(BaseModel):
 
 class ServerTrader:
     def __init__(self):
+        # Initialize Web3 with PoA middleware
         self.polygon_rpc = "https://polygon-rpc.com"
         self.w3 = Web3(Web3.HTTPProvider(self.polygon_rpc))
+        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         
-        # Add PoA middleware at initialization
-        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)        
+        # Initialize CLOB client
         self.client = ClobClient(
             "https://clob.polymarket.com",
             key=PRIVATE_KEY,
@@ -45,122 +46,87 @@ class ServerTrader:
         # Contract addresses
         self.usdc_address = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
         self.exchange_address = Web3.to_checksum_address("0x4bfb41d5B3570defd03c39a9A4d8de6bd8b8982e")
-        self.neg_risk_exchange = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
-        self.neg_risk_adapter = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
-        self.ctf_address = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
         
-        # Contract ABIs
+        # USDC Contract ABI
         self.usdc_abi = [
             {"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
             {"inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
             {"inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"}
         ]
         
-        self.erc1155_abi = [
-            {"inputs": [{"internalType": "address", "name": "operator", "type": "address"}, {"internalType": "bool", "name": "approved", "type": "bool"}], "name": "setApprovalForAll", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
-        ]
-        
-        # Initialize contracts
+        # Initialize USDC contract
         self.usdc = self.w3.eth.contract(address=self.usdc_address, abi=self.usdc_abi)
-        self.ctf = self.w3.eth.contract(address=self.ctf_address, abi=self.erc1155_abi)
         self.wallet_address = self.w3.eth.account.from_key(PRIVATE_KEY).address
         
         logger.info(f"Server trader initialized with wallet {self.wallet_address}")
 
-    def approve_usdc(self) -> dict:
-        try:
-            logger.info("Starting approval process...")
-            
-            addresses_to_approve = [
-                self.exchange_address,
-                self.neg_risk_exchange,
-                self.neg_risk_adapter
-            ]
-            
-            results = []
-            nonce = self.w3.eth.get_transaction_count(self.wallet_address)
-            
-            for address in addresses_to_approve:
-                # USDC Approval
-                logger.info(f"Approving USDC for {address}")
-                max_amount = int("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
-                
-                base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
-                priority_fee = 30_000_000_000  # 30 gwei
-                max_fee = base_fee * 3 + priority_fee
-                
-                txn = self.usdc.functions.approve(
-                    address,
-                    max_amount
-                ).build_transaction({
-                    'chainId': 137,
-                    'gas': 100000,
-                    'maxFeePerGas': max_fee,
-                    'maxPriorityFeePerGas': priority_fee,
-                    'nonce': nonce,
-                    'from': self.wallet_address
-                })
-                
-                signed_txn = self.w3.eth.account.sign_transaction(txn, PRIVATE_KEY)
-                tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-                
-                # ERC1155 Approval
-                logger.info(f"Approving CTF for {address}")
-                nonce += 1
-                ctf_txn = self.ctf.functions.setApprovalForAll(
-                    address,
-                    True
-                ).build_transaction({
-                    'chainId': 137,
-                    'gas': 100000,
-                    'maxFeePerGas': max_fee,
-                    'maxPriorityFeePerGas': priority_fee,
-                    'nonce': nonce,
-                    'from': self.wallet_address
-                })
-                
-                signed_ctf_txn = self.w3.eth.account.sign_transaction(ctf_txn, PRIVATE_KEY)
-                ctf_tx_hash = self.w3.eth.send_raw_transaction(signed_ctf_txn.raw_transaction)
-                ctf_receipt = self.w3.eth.wait_for_transaction_receipt(ctf_tx_hash, timeout=180)
-                
-                nonce += 1
-                results.append({
-                    "address": address,
-                    "usdc_tx": receipt['transactionHash'].hex(),
-                    "ctf_tx": ctf_receipt['transactionHash'].hex()
-                })
-                
-            return {
-                "success": True,
-                "approvals": results
-            }
-                
-        except Exception as e:
-            logger.error(f"Approval failed with error: {str(e)}")
-            raise ValueError(f"Failed to approve: {str(e)}")
+    def check_balances(self, amount: float, price: float) -> dict:
+        """Check USDC balance and allowance for the trade amount"""
+        usdc_amount_needed = amount * price
+        usdc_amount_with_buffer = usdc_amount_needed * 1.02  # 2% buffer
 
-    def check_balances(self, amount: float) -> dict:
         balance = self.usdc.functions.balanceOf(self.wallet_address).call()
         balance_usdc = balance / 1e6
         
         allowance = self.usdc.functions.allowance(self.wallet_address, self.exchange_address).call()
         allowance_usdc = allowance / 1e6
         
-        # Add some margin for gas fees and slippage
-        amount_with_buffer = amount * 1.02  # 2% buffer
-        
-        logger.info(f"Balance check - Balance: {balance_usdc:.2f} USDC, Allowance: {allowance_usdc:.2f} USDC, Required (with buffer): {amount_with_buffer:.2f} USDC")
+        logger.info(f"Balance check details:")
+        logger.info(f"USDC Balance: {balance_usdc} USDC")
+        logger.info(f"Current allowance: {allowance_usdc} USDC")
+        logger.info(f"Required amount: {usdc_amount_needed} USDC (with buffer: {usdc_amount_with_buffer} USDC)")
         
         return {
             "balance_usdc": balance_usdc,
             "allowance_usdc": allowance_usdc,
-            "required_amount": amount_with_buffer,
-            "has_sufficient_balance": balance_usdc >= amount_with_buffer,
-            "has_sufficient_allowance": allowance_usdc >= amount_with_buffer
+            "required_amount": usdc_amount_with_buffer,
+            "has_sufficient_balance": balance_usdc >= usdc_amount_with_buffer,
+            "has_sufficient_allowance": allowance_usdc >= usdc_amount_with_buffer
         }
 
+    def approve_usdc(self) -> dict:
+        """Approve USDC spending for the exchange"""
+        try:
+            logger.info("Starting USDC approval process...")
+            max_amount = int("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+            
+            # Get current gas prices
+            base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
+            priority_fee = 30_000_000_000  # 30 gwei
+            max_fee = base_fee * 3 + priority_fee
+            
+            txn = self.usdc.functions.approve(
+                self.exchange_address,
+                max_amount
+            ).build_transaction({
+                'chainId': 137,
+                'gas': 100000,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                'from': self.wallet_address
+            })
+            
+            signed_txn = self.w3.eth.account.sign_transaction(txn, PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            logger.info(f"Approval transaction sent: {tx_hash.hex()}")
+            
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+            if receipt['status'] != 1:
+                raise ValueError("Approval transaction failed")
+                
+            logger.info("Approval transaction confirmed")
+            return {
+                "success": True,
+                "tx_hash": receipt['transactionHash'].hex()
+            }
+            
+        except Exception as e:
+            logger.error(f"USDC approval failed: {str(e)}")
+            raise ValueError(f"Failed to approve USDC: {str(e)}")
+
     def check_price(self, market_id: str, expected_price: float, side: str) -> bool:
+        """Verify the current market price matches expected price"""
         orderbook = self.client.get_order_book(market_id)
         
         if side.upper() == "BUY":
@@ -172,19 +138,19 @@ class ServerTrader:
             raise ValueError(f"No {'sell' if side.upper() == 'BUY' else 'buy'} orders available")
         
         price_diff = abs(current_price - expected_price) / expected_price
-        if price_diff > 0.01:
+        if price_diff > 0.01:  # 1% price deviation tolerance
             raise ValueError(f"Price deviation too high. Expected: {expected_price}, Current: {current_price}")
         
         return True
 
     def execute_trade(self, market_id: str, price: float, amount: float, side: str) -> dict:
+        """Execute a trade with the given parameters"""
         try:
-            balance_check = self.check_balances(amount)
+            # Check balance and allowance
+            balance_check = self.check_balances(amount, price)
             logger.info(f"Balance check results: {balance_check}")
             
-            # Calculate the exact amount needed in USDC (amount in decimal * price)
             usdc_amount_needed = amount * price
-            
             if not balance_check["has_sufficient_balance"]:
                 raise ValueError(f"Insufficient USDC balance. Have: {balance_check['balance_usdc']:.2f} USDC, Need: {usdc_amount_needed:.2f} USDC")
             
@@ -193,21 +159,20 @@ class ServerTrader:
                 approval = self.approve_usdc()
                 if not approval["success"]:
                     raise ValueError("Failed to approve USDC")
-                    
-                # Wait for a few seconds to make sure approval is confirmed
-                logger.info("Waiting for approval confirmation...")
-                time.sleep(10)
                 
-                # Check allowance again
-                new_balance_check = self.check_balances(amount)
+                # Wait and verify approval
+                logger.info("Verifying approval...")
+                new_balance_check = self.check_balances(amount, price)
                 if not new_balance_check["has_sufficient_allowance"]:
                     raise ValueError("USDC approval failed to increase allowance")
                 
                 logger.info("USDC approved successfully")
 
+            # Verify price hasn't moved significantly
             logger.info("Checking market price...")
             self.check_price(market_id, price, side)
 
+            # Create and submit order
             logger.info("Creating order...")
             order_args = OrderArgs(
                 price=price,
