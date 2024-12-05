@@ -5,12 +5,17 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 from pydantic import BaseModel
+from typing import List, Optional
 import os
+import ast
+import httpx
 from dotenv import load_dotenv
 import logging
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 import time
+from gql import gql, Client
+from gql.transport.requests import RequestsHTTPTransport
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -26,12 +31,29 @@ class OrderRequest(BaseModel):
     amount: float
     side: str
 
+class Position(BaseModel):
+    market_id: str
+    token_id: str
+    market_question: str
+    outcomes: List[str]
+    prices: List[float]
+    balances: List[float]
+
+class SellPositionRequest(BaseModel):
+    token_id: str
+    amount: float
+    price: Optional[float] = None 
+
 class ServerTrader:
     def __init__(self):
         # Initialize Web3 with PoA middleware
         self.polygon_rpc = "https://polygon-rpc.com"
         self.w3 = Web3(Web3.HTTPProvider(self.polygon_rpc))
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        
+        # Initialize API endpoints
+        self.gamma_url = "https://gamma-api.polymarket.com"
+        self.gamma_markets_endpoint = self.gamma_url + "/markets"
         
         # Initialize CLOB client
         self.client = ClobClient(
@@ -45,20 +67,65 @@ class ServerTrader:
 
         # Contract addresses
         self.usdc_address = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+        self.ctf_address = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
         self.exchange_address = Web3.to_checksum_address("0x4bfb41d5B3570defd03c39a9A4d8de6bd8b8982e")
         
-        # USDC Contract ABI
+        # Initialize USDC contract
         self.usdc_abi = [
             {"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
             {"inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
             {"inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"}
         ]
         
-        # Initialize USDC contract
+        # Initialize CTF contract ABI
+        self.ctf_abi = [
+            {
+                "inputs": [
+                    {"name": "account", "type": "address"},
+                    {"name": "id", "type": "uint256"}
+                ],
+                "name": "balanceOf",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+        
+        # Initialize contracts
         self.usdc = self.w3.eth.contract(address=self.usdc_address, abi=self.usdc_abi)
+        self.ctf = self.w3.eth.contract(address=self.ctf_address, abi=self.ctf_abi)
+        
+        # Set wallet address
         self.wallet_address = self.w3.eth.account.from_key(PRIVATE_KEY).address
         
         logger.info(f"Server trader initialized with wallet {self.wallet_address}")
+
+    def get_market(self, token_id: str) -> dict:
+        """Get market information for a specific token ID"""
+        params = {"clob_token_ids": token_id}
+        res = httpx.get(self.gamma_markets_endpoint, params=params)
+        if res.status_code == 200:
+            data = res.json()
+            if data:
+                market = data[0]
+                return {
+                    "id": int(market["id"]),
+                    "question": market["question"],
+                    "outcomes": str(market["outcomes"]),
+                    "outcome_prices": str(market["outcomePrices"]),
+                }
+        raise ValueError(f"Could not fetch market data for token {token_id}")
+
+    def get_orderbook_price(self, token_id: str) -> List[float]:
+        """Get current bid and ask prices from orderbook"""
+        try:
+            orderbook = self.client.get_order_book(token_id)
+            bid_price = float(orderbook.bids[0].price) if orderbook.bids else 0.0
+            ask_price = float(orderbook.asks[0].price) if orderbook.asks else 0.0
+            return [bid_price, ask_price]
+        except Exception as e:
+            logger.error(f"Error getting price for token {token_id}: {str(e)}")
+            return [0.0, 0.0]
 
     def check_balances(self, amount: float, price: float) -> dict:
         """Check USDC balance and allowance for the trade amount"""
@@ -197,6 +264,57 @@ class ServerTrader:
             logger.error(f"Trade execution failed: {str(e)}")
             raise e
 
+    def get_positions(self) -> List[Position]:
+        """Fetch positions owned by the wallet using subgraph"""
+        try:
+            transport = RequestsHTTPTransport(
+                url='https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/positions-subgraph/0.0.7/gn'
+            )
+            client = Client(transport=transport, fetch_schema_from_transport=True)
+            
+            query = gql("""
+            query GetPositions($address: String!) {
+                userBalances(where: {user: $address}) {
+                    asset {
+                        id
+                        condition {
+                            id
+                        }
+                        outcomeIndex
+                    }
+                    balance
+                    user
+                }
+            }
+            """)
+            
+            result = client.execute(query, variable_values={
+                "address": self.wallet_address.lower()
+            })
+            
+            positions = []
+            for balance in result['userBalances']:
+                if int(balance['balance']) > 0:
+                    market_info = self.get_market(balance['asset']['id'])
+                    prices = self.get_orderbook_price(balance['asset']['id'])
+                    
+                    positions.append(Position(
+                        market_id=str(market_info["id"]),  # Convert to string
+                        token_id=balance['asset']['id'],
+                        market_question=market_info["question"],
+                        outcomes=ast.literal_eval(market_info["outcomes"]),
+                        prices=[float(p) for p in ast.literal_eval(market_info["outcome_prices"])],
+                        balances=[int(balance['balance']) / 1e18 if i == int(balance['asset']['outcomeIndex']) else 0.0 
+                                for i in range(len(ast.literal_eval(market_info["outcomes"])))]
+                    ))
+                    logger.info(f"Found position: {positions[-1]}")
+                    
+            return positions
+        except Exception as e:
+            logger.error(f"Error fetching positions from subgraph: {str(e)}")
+            raise ValueError(f"Failed to fetch positions: {str(e)}")
+
+# FastAPI setup
 app = FastAPI(title="Polymarket Trading Server")
 app.add_middleware(
     CORSMiddleware,
@@ -234,6 +352,24 @@ async def get_status():
     except Exception as e:
         logger.error(f"Status check failed: {str(e)}")
         return {"status": "error", "error": str(e)}
+
+@app.get("/api/positions")
+async def get_positions():
+    """Get all current positions and their values"""
+    try:
+        positions = trader.get_positions()
+        formatted_positions = [{
+            **position.dict(),
+            "realized_pnl": float(position.realized_pnl) if hasattr(position, 'realized_pnl') else None,
+            "unrealized_pnl": float(position.unrealized_pnl) if hasattr(position, 'unrealized_pnl') else None
+        } for position in positions]
+        return JSONResponse(content=formatted_positions)
+    except Exception as e:
+        logger.error(f"Failed to get positions: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
 
 @app.post("/api/order")
 async def place_order(order: OrderRequest):
