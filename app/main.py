@@ -42,7 +42,6 @@ class Position(BaseModel):
 class SellPositionRequest(BaseModel):
     token_id: str
     amount: float
-    price: Optional[float] = None 
 
 class ServerTrader:
     def __init__(self):
@@ -388,6 +387,61 @@ async def place_order(order: OrderRequest):
         )
     except Exception as e:
         logger.error(f"Order execution failed: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
+@app.post("/api/sell-position")
+async def sell_position(position: SellPositionRequest):
+    """Sell a position at market price (best available bid)"""
+    try:
+        # Get current position details
+        positions = trader.get_positions()
+        position_to_sell = next(
+            (p for p in positions if p.token_id == position.token_id), 
+            None
+        )
+        
+        if not position_to_sell:
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "error": f"Position with token ID {position.token_id} not found"}
+            )
+            
+        # Get current market price from orderbook
+        orderbook = trader.client.get_order_book(position.token_id)
+        if not orderbook.bids:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "No bids available in orderbook"}
+            )
+        
+        price = float(orderbook.bids[0].price)
+            
+        # Verify we have enough balance
+        available_balance = sum(position_to_sell.balances)
+        if position.amount > available_balance:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False, 
+                    "error": f"Insufficient balance. Have: {available_balance}, Want to sell: {position.amount}"
+                }
+            )
+            
+        # Execute the market sell
+        result = trader.execute_trade(
+            market_id=position.token_id,
+            price=price,
+            amount=position.amount,
+            side="SELL"
+        )
+        
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        logger.error(f"Error selling position: {str(e)}")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": str(e)}
