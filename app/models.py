@@ -1,6 +1,6 @@
 # src/models.py
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional, Literal
 
 class OrderRequest(BaseModel):
     market_id: str
@@ -19,3 +19,18 @@ class Position(BaseModel):
 class SellPositionRequest(BaseModel):
     token_id: str
     amount: float
+
+class SignedOrder(BaseModel):
+    market_id: str
+    price: float
+    amount: float
+    side: Literal["BUY", "SELL"]
+    nonce: int
+    user_address: str
+    signature: str
+
+class OrderStatus(BaseModel):
+    order_id: str
+    status: Literal["pending", "executing", "completed", "failed"]
+    error: Optional[str] = None
+    transaction_hash: Optional[str] = None
