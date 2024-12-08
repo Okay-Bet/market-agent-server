@@ -3,10 +3,12 @@ from pydantic import BaseModel
 from typing import List, Optional, Literal
 
 class OrderRequest(BaseModel):
-    market_id: str
-    price: float
-    amount: float
+    user_address: str
+    token_id: str
+    price: float  
+    amount: float  
     side: str
+    is_yes_token: bool 
 
 class Position(BaseModel):
     market_id: str

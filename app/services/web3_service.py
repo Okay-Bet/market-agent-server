@@ -58,3 +58,36 @@ class Web3Service:
         except Exception as e:
             logger.error(f"USDC approval failed: {str(e)}")
             raise ValueError(f"Failed to approve USDC: {str(e)}")
+
+async def verify_usdc_transaction(self, tx_hash: str, expected_amount: float, 
+                                from_address: str, to_address: str) -> dict:
+    try:
+        tx_receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+        if not tx_receipt or not tx_receipt['status']:
+            return {
+                'success': False,
+                'error': 'Transaction failed or not found'
+            }
+
+        # Verify the transaction details
+        tx = self.w3.eth.get_transaction(tx_hash)
+        if (tx['from'].lower() != from_address.lower() or 
+            tx['to'].lower() != self.usdc.address.lower()):
+            return {
+                'success': False,
+                'error': 'Invalid transaction addresses'
+            }
+
+        # Decode transfer event
+        transfer_event = self.usdc.events.Transfer().process_receipt(tx_receipt)[0]
+        amount = transfer_event['args']['value'] / 1e6  # Convert from USDC decimals
+
+        if abs(amount - expected_amount) > 0.01:  # Allow 1% deviation
+            return {
+                'success': False,
+                'error': f'Invalid transfer amount. Expected: {expected_amount}, Got: {amount}'
+            }
+
+        return {'success': True}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}

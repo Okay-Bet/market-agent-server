@@ -53,22 +53,63 @@ class TraderService:
             "has_sufficient_allowance": allowance_usdc >= usdc_amount_with_buffer
         }
 
-    def check_price(self, market_id: str, expected_price: float, side: str):
-        orderbook = self.client.get_order_book(market_id)
+    def check_price(self, token_id: str, expected_price: float, side: str, is_yes_token: bool):
+        """
+        Validates if the requested order price is within acceptable range of market price.
         
-        if side.upper() == "BUY":
-            current_price = float(orderbook.asks[0].price) if orderbook.asks else None
-        else:
-            current_price = float(orderbook.bids[0].price) if orderbook.bids else None
-        
-        if current_price is None:
-            raise ValueError(f"No {'sell' if side.upper() == 'BUY' else 'buy'} orders available")
-        
-        price_diff = abs(current_price - expected_price) / expected_price
-        if price_diff > 0.01:
-            raise ValueError(f"Price deviation too high. Expected: {expected_price}, Current: {current_price}")
-        
-        return True
+        Args:
+            token_id: The market token ID
+            expected_price: The price we want to trade at
+            side: "BUY" or "SELL"
+            is_yes_token: Whether this is a YES or NO token
+        """
+        try:
+            orderbook = self.client.get_order_book(token_id)
+            
+            logger.info(f"Raw orderbook data - Bids: {orderbook.bids}, Asks: {orderbook.asks}")
+            
+            # Convert to float and handle empty orderbooks
+            bids = [float(bid.price) for bid in orderbook.bids] if orderbook.bids else []
+            asks = [float(ask.price) for ask in orderbook.asks] if orderbook.asks else []
+            
+            # Get best bid/ask
+            best_bid = max(bids) if bids else None
+            best_ask = min(asks) if asks else None
+            
+            logger.info(f"Best bid: {best_bid}, Best ask: {best_ask}")
+            
+            # For NO tokens, we need to invert the prices (1 - price)
+            if not is_yes_token:
+                expected_price = 1 - expected_price
+                if best_bid is not None:
+                    best_bid = 1 - best_bid
+                if best_ask is not None:
+                    best_ask = 1 - best_ask
+                logger.info(f"NO token - Adjusted prices - Expected: {expected_price}, Best bid: {best_bid}, Best ask: {best_ask}")
+
+            # If selling, compare with bid (lower price)
+            if side == "SELL":
+                if not best_bid:
+                    raise ValueError("No buy orders available in orderbook")
+                market_price = best_bid
+                # Allow selling at higher prices
+                if expected_price < market_price * 0.99:  # 1% tolerance
+                    raise ValueError(f"Sell price too low. Your price: {expected_price:.3f}, Market price: {market_price:.3f}")
+                    
+            # If buying, compare with ask (higher price)
+            else:  # BUY
+                if not best_ask:
+                    raise ValueError("No sell orders available in orderbook")
+                market_price = best_ask
+                # Allow buying at lower prices
+                if expected_price > market_price * 1.01:  # 1% tolerance
+                    raise ValueError(f"Buy price too high. Your price: {expected_price:.3f}, Market price: {market_price:.3f}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error checking price for token {token_id}: {str(e)}")
+            raise e
 
     def execute_trade(self, market_id: str, price: float, amount: float, side: str):
         try:
