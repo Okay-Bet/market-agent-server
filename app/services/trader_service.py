@@ -5,7 +5,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
 import ast
-from ..config import PRIVATE_KEY, SUBGRAPH_URL, logger
+from ..config import PRIVATE_KEY, SUBGRAPH_URL, logger, EXCHANGE_ADDRESS
 from ..models import Position
 from .web3_service import Web3Service
 from .market_service import MarketService
@@ -111,34 +111,79 @@ class TraderService:
             logger.error(f"Error checking price for token {token_id}: {str(e)}")
             raise e
 
-    def execute_trade(self, market_id: str, price: float, amount: float, side: str):
+    def execute_trade(self, token_id: str, price: float, amount: float, side: str, is_yes_token: bool):
         try:
-            balance_check = self.check_balances(amount, price)
-            
-            if not balance_check["has_sufficient_balance"]:
-                raise ValueError(f"Insufficient USDC balance. Have: {balance_check['balance_usdc']:.2f} USDC")
-            
-            if not balance_check["has_sufficient_allowance"]:
+            # Ensure agent wallet has approved USDC spending
+            logger.info("Checking and setting USDC approval for agent wallet...")
+            try:
                 approval = self.web3_service.approve_usdc()
-                if not approval["success"]:
+                if approval["success"]:
+                    logger.info("Successfully approved USDC spending")
+                else:
                     raise ValueError("Failed to approve USDC")
-                
-                new_balance_check = self.check_balances(amount, price)
-                if not new_balance_check["has_sufficient_allowance"]:
-                    raise ValueError("USDC approval failed to increase allowance")
+            except Exception as e:
+                logger.error(f"USDC approval failed: {str(e)}")
+                raise ValueError(f"Failed to approve USDC: {str(e)}")
 
-            self.check_price(market_id, price, side)
+            # Convert USDC units to actual USDC amount
+            usdc_amount = float(amount) / 1_000_000
+            logger.info(f"USDC amount: {usdc_amount}")
 
+            # Calculate outcome tokens based on order side
+            if side == "BUY":
+                outcome_tokens = usdc_amount / float(price)
+                logger.info(f"BUY order: {usdc_amount} USDC gets {outcome_tokens} tokens at {price} USDC/token")
+            else:  # SELL
+                outcome_tokens = usdc_amount * (1 / float(price))
+                logger.info(f"SELL order: {usdc_amount} USDC worth of tokens = {outcome_tokens} tokens at {price} USDC/token")
+
+            logger.info(f"Initial outcome tokens calculation: {outcome_tokens} at price {price}")
+
+            # Ensure minimum trade size
+            MIN_TRADE_SIZE = 5.0
+            if outcome_tokens < MIN_TRADE_SIZE:
+                min_usdc_needed = MIN_TRADE_SIZE * float(price)
+                raise ValueError(
+                    f"Trade size too small. Minimum is {MIN_TRADE_SIZE} tokens, got {outcome_tokens:.2f}. "
+                    f"Need at least {min_usdc_needed:.6f} USDC for this price."
+                )
+
+            # Round to 2 decimal places as required by CLOB
+            rounded_outcome_tokens = float(int(outcome_tokens * 100) / 100)  # Force 2 decimal precision
+            logger.info(f"Rounded outcome tokens: {rounded_outcome_tokens}")
+
+            # Check balances using the USDC amount
+            balance_check = self.check_balances(usdc_amount, price)
+            if not balance_check["has_sufficient_balance"]:
+                raise ValueError(f"Insufficient USDC balance. Have: {balance_check['balance_usdc']:.2f} USDC, Need: {balance_check['required_amount']:.2f} USDC")
+
+            # Check price considering yes/no token type
+            self.check_price(token_id, price, side, is_yes_token)
+
+            logger.info(f"Creating order with price: {price}, outcome tokens: {rounded_outcome_tokens}")
+            
             order_args = OrderArgs(
                 price=price,
-                size=amount,
+                size=rounded_outcome_tokens,
                 side=BUY if side.upper() == "BUY" else SELL,
-                token_id=market_id
+                token_id=token_id
             )
-            
+
             signed_order = self.client.create_order(order_args)
-            response = self.client.post_order(signed_order, OrderType.FOK)
             
+            # Use FOK for buys (market orders), GTC for sells (limit orders)
+            if side.upper() == "BUY":
+                logger.info("Using FOK order type for market BUY order")
+                response = self.client.post_order(signed_order, OrderType.FOK)
+            else:
+                logger.info("Using GTC order type for limit SELL order")
+                response = self.client.post_order(signed_order, OrderType.GTC)
+
+            logger.info(f"Order response: {response}")
+            
+            if response.get("errorMsg"):
+                raise ValueError(f"Order placement failed: {response['errorMsg']}")
+
             return {
                 "success": True,
                 "order_id": response.get("orderID"),

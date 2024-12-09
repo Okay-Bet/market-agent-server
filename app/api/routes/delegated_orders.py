@@ -23,79 +23,33 @@ async def submit_delegated_order(order: OrderRequest):
                 detail=f"Invalid order side: {order.side}. Must be either 'BUY' or 'SELL'"
             )
 
-        # Verify the market exists and is valid
+        # Verify the token exists and is valid
         try:
-            orderbook = trader_service.client.get_order_book(order.market_id)
+            orderbook = trader_service.client.get_order_book(order.token_id)
             if not orderbook:
-                raise HTTPException(status_code=400, detail="Invalid market ID")
+                raise HTTPException(status_code=400, detail="Invalid token ID")
         except Exception as e:
-            logger.error(f"Market validation failed: {str(e)}")
-            raise HTTPException(status_code=400, detail="Invalid market ID")
+            logger.error(f"Token validation failed: {str(e)}")
+            raise HTTPException(status_code=400, detail="Invalid token ID")
 
-        # Calculate expected USDC amount
-        usdc_amount = order.price * order.amount * 1.02  # Including 2% buffer
-
-        # Verify USDC transaction
-        try:
-            tx_receipt = await web3_service.verify_usdc_transaction(
-                tx_hash=order.usdc_transaction_hash,
-                expected_amount=usdc_amount,
-                from_address=order.user_address,
-                to_address=order.agent_wallet
-            )
-            if not tx_receipt['success']:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"USDC transaction verification failed: {tx_receipt['error']}"
-                )
-        except Exception as e:
-            logger.error(f"USDC verification failed: {str(e)}")
-            raise HTTPException(
-                status_code=400,
-                detail="Failed to verify USDC transfer"
-            )
-
-        # Store order in Redis with initial status
-        order_id = f"order_{order.user_address}_{order.market_id}_{order.usdc_transaction_hash[:10]}"
-        redis_service.store_order(order_id, {
-            "status": "pending",
-            "user_address": order.user_address,
-            "market_id": order.market_id,
-            "price": order.price,
-            "amount": order.amount,
-            "side": order.side,
-            "usdc_transaction": order.usdc_transaction_hash
-        })
-
-        # Execute trade
+        # Execute trade - Remove the USDC unit conversion since amount is already correct
         try:
             logger.info(f"Executing trade for user: {order.user_address}")
             result = trader_service.execute_trade(
-                market_id=order.market_id,
+                token_id=order.token_id,
                 price=order.price,
-                amount=order.amount,
-                side=order.side
+                amount=float(order.amount),  # Remove the division by 1_000_000
+                side=order.side,
+                is_yes_token=order.is_yes_token
             )
-            
-            # Update order status in Redis
-            redis_service.update_order_status(order_id, {
-                "status": "completed",
-                "transaction": result
-            })
 
             logger.info(f"Trade execution result: {result}")
             return JSONResponse(content={
                 "success": True,
                 "status": "completed",
-                "order_id": order_id,
                 "transaction": result
             })
         except Exception as e:
-            # Update order status in Redis with error
-            redis_service.update_order_status(order_id, {
-                "status": "failed",
-                "error": str(e)
-            })
             logger.error(f"Trade execution failed: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -104,7 +58,7 @@ async def submit_delegated_order(order: OrderRequest):
     except Exception as e:
         logger.error(f"Order submission failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 
 @router.get("/api/user-orders/{address}")
 async def get_user_orders(address: str):
