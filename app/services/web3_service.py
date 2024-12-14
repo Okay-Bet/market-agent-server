@@ -25,12 +25,14 @@ class Web3Service:
         try:
             logger.info("Starting USDC approval process...")
             max_amount = int("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+            
+            # Increase base fee multiplier and priority fee
             base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
-            priority_fee = 30_000_000_000  # 30 gwei
-            max_fee = base_fee * 3 + priority_fee
+            priority_fee = 50_000_000_000  # 50 gwei
+            max_fee = base_fee * 4 + priority_fee  # Increased from 3x to 4x
 
             txn = self.usdc.functions.approve(
-                Web3.to_checksum_address(EXCHANGE_ADDRESS),
+                self.w3.to_checksum_address(EXCHANGE_ADDRESS),
                 max_amount
             ).build_transaction({
                 'chainId': 137,
@@ -43,7 +45,9 @@ class Web3Service:
 
             signed_txn = self.w3.eth.account.sign_transaction(txn, PRIVATE_KEY)
             tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+            
+            # Increase timeout to 300 seconds
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
             if receipt['status'] != 1:
                 raise ValueError("Approval transaction failed")

@@ -113,20 +113,30 @@ class TraderService:
 
     def execute_trade(self, token_id: str, price: float, amount: float, side: str, is_yes_token: bool):
         try:
-            # Ensure agent wallet has approved USDC spending
-            logger.info("Checking and setting USDC approval for agent wallet...")
-            try:
-                approval = self.web3_service.approve_usdc()
-                if approval["success"]:
-                    logger.info("Successfully approved USDC spending")
-                else:
-                    raise ValueError("Failed to approve USDC")
-            except Exception as e:
-                logger.error(f"USDC approval failed: {str(e)}")
-                raise ValueError(f"Failed to approve USDC: {str(e)}")
-
             # Convert USDC units to actual USDC amount
-            usdc_amount = float(amount) 
+            usdc_amount = float(amount) / 1_000_000
+            required_amount = int(usdc_amount * 1.02)  # Include 2% buffer
+            logger.info(f"USDC amount: {usdc_amount}")
+            
+            # Check existing allowance before attempting approval
+            allowance = self.web3_service.usdc.functions.allowance(
+                self.web3_service.wallet_address,
+                self.web3_service.w3.to_checksum_address(EXCHANGE_ADDRESS)
+            ).call()
+            
+            # Only approve if current allowance is insufficient
+            if allowance < required_amount:
+                logger.info("Insufficient allowance, requesting approval...")
+                try:
+                    approval = self.web3_service.approve_usdc()
+                    if not approval["success"]:
+                        raise ValueError("Failed to approve USDC")
+                except Exception as e:
+                    logger.error(f"USDC approval failed: {str(e)}")
+                    raise ValueError(f"Failed to approve USDC: {str(e)}")
+            else:
+                logger.info("Sufficient allowance exists, skipping approval")
+
             logger.info(f"USDC amount: {usdc_amount}")
 
             # Calculate outcome tokens based on order side
