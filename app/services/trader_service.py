@@ -126,7 +126,7 @@ class TraderService:
                 raise ValueError(f"Failed to approve USDC: {str(e)}")
 
             # Convert USDC units to actual USDC amount
-            usdc_amount = float(amount) / 1_000_000
+            usdc_amount = float(amount) 
             logger.info(f"USDC amount: {usdc_amount}")
 
             # Calculate outcome tokens based on order side

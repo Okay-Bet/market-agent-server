@@ -130,7 +130,7 @@ async def validate_order(order: OrderRequest):
             raise HTTPException(status_code=400, detail="Invalid token ID")
 
         # Calculate expected USDC amount
-        usdc_amount = price * amount * 1.02  # Including 2% buffer
+        usdc_amount = amount * 1.02  # Including 2% buffer
 
         # Log prices for debugging
         logger.info(f"Input price (decimal): {price}")
