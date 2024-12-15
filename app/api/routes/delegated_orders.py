@@ -63,15 +63,15 @@ async def submit_delegated_order(order: OrderRequest):
 @router.get("/api/user-orders/{address}")
 async def get_user_orders(address: str):
     try:
-        logger.info(f"Fetching orders for address: {address}")
+        print(f"Received request for address: {address}")  # Debug log
         
         # Get pending orders from Redis
         pending_orders = redis_service.get_user_pending_orders(address)
-        logger.info(f"Found {len(pending_orders)} pending orders")
+        print(f"Pending orders: {pending_orders}")  # Debug log
 
         # Get completed orders from subgraph
         completed_orders = await trader_service.get_positions()
-        logger.info(f"Found {len(completed_orders)} completed orders")
+        print(f"Completed orders: {completed_orders}")  # Debug log
 
         return JSONResponse(content={
             "pending_orders": pending_orders,
@@ -79,7 +79,7 @@ async def get_user_orders(address: str):
         })
 
     except Exception as e:
-        logger.error(f"Failed to get user orders: {str(e)}")
+        print(f"Error in get_user_orders: {str(e)}")  # Debug log
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/api/order-status/{order_id}")

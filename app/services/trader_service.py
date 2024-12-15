@@ -22,6 +22,11 @@ class TraderService:
         self.credentials = self.client.create_or_derive_api_creds()
         self.client.set_api_creds(self.credentials)
 
+         # Initialize GQL client for subgraph
+        transport = RequestsHTTPTransport(url=SUBGRAPH_URL)
+        self.gql_client = Client(transport=transport, fetch_schema_from_transport=True)
+
+
     def get_orderbook_price(self, token_id: str):
         try:
             orderbook = self.client.get_order_book(token_id)
@@ -267,46 +272,65 @@ class TraderService:
     
     async def get_positions(self):
         try:
-            transport = RequestsHTTPTransport(url=SUBGRAPH_URL)
-            client = Client(transport=transport, fetch_schema_from_transport=True)
-            
             query = gql("""
-            query GetPositions($address: String!) {
-                userBalances(where: {user: $address}) {
-                    asset {
-                        id
-                        condition {
+                query GetPositions($address: String!) {
+                    userBalances(where: {user: $address}) {
+                        asset {
                             id
+                            condition {
+                                id
+                            }
+                            outcomeIndex
                         }
-                        outcomeIndex
+                        balance
+                        user
                     }
-                    balance
-                    user
                 }
-            }
             """)
-            
-            result = client.execute(query, variable_values={
+                
+            result = self.gql_client.execute(query, variable_values={
                 "address": self.web3_service.wallet_address.lower()
             })
+            
+            print(f"Raw query result: {result}")  # Debug log
             
             positions = []
             for balance in result['userBalances']:
                 if int(balance['balance']) > 0:
+                    print(f"Processing balance: {balance}")
                     market_info = await MarketService.get_market(balance['asset']['id'])
+                    print(f"Market info: {market_info}")
                     prices = self.get_orderbook_price(balance['asset']['id'])
+                    print(f"Current prices: {prices}")
                     
-                    positions.append(Position(
+                    # Create balance array with proper positioning
+                    outcome_count = len(ast.literal_eval(market_info["outcomes"]))
+                    balances = [0.0] * outcome_count
+                    outcome_index = int(balance['asset']['outcomeIndex'])
+                    raw_balance = int(balance['balance'])
+                    converted_balance = raw_balance / 1e6
+                    
+                    print(f"Converting balance {raw_balance} to {converted_balance}")
+                    
+                    balances[outcome_index] = converted_balance
+                    
+                    position = Position(
                         market_id=str(market_info["id"]),
                         token_id=balance['asset']['id'],
                         market_question=market_info["question"],
                         outcomes=ast.literal_eval(market_info["outcomes"]),
                         prices=[float(p) for p in ast.literal_eval(market_info["outcome_prices"])],
-                        balances=[int(balance['balance']) / 1e18 if i == int(balance['asset']['outcomeIndex']) else 0.0 
-                                for i in range(len(ast.literal_eval(market_info["outcomes"])))]
-                    ))
-                    
+                        balances=balances,
+                        # These will use the default None values
+                        entry_prices=None,
+                        timestamp=None
+                    )
+                    print(f"Created position: {position}")
+                    positions.append(position)
+                        
+            print(f"Final positions: {positions}")
             return positions
+                
         except Exception as e:
-            logger.error(f"Error fetching positions from subgraph: {str(e)}")
+            print(f"Error in get_positions: {str(e)}")
             raise ValueError(f"Failed to fetch positions: {str(e)}")

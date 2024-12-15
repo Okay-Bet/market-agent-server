@@ -17,6 +17,8 @@ class Position(BaseModel):
     outcomes: List[str]
     prices: List[float]
     balances: List[float]
+    entry_prices: Optional[List[float]] = None
+    timestamp: Optional[str] = None
 
 class SellPositionRequest(BaseModel):
     token_id: str
