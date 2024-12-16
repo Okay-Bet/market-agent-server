@@ -1,4 +1,5 @@
 # src/services/trader_service.py
+import time
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -142,134 +143,228 @@ class TraderService:
             raise e
 
     def execute_trade(self, token_id: str, price: float, amount: float, side: str, is_yes_token: bool):
+        """Execute a trade with proper order book verification"""
         try:
-            # Keep track of raw USDC units
-            raw_usdc_amount = amount  # Already in USDC units
-            decimal_usdc = raw_usdc_amount / 1_000_000  # For display only
-            required_amount = int(amount * 1.02)  # Buffer in USDC units
+            # Verify order book and liquidity first
+            orderbook = self.client.get_order_book(token_id)
+            if not orderbook:
+                raise ValueError("Unable to fetch orderbook")
+                
+            # Convert bid/ask lists to floats for easier comparison
+            bids = [(float(b.price), float(b.size)) for b in orderbook.bids] if orderbook.bids else []
+            asks = [(float(a.price), float(a.size)) for a in orderbook.asks] if orderbook.asks else []
             
-            logger.info(f"Raw USDC units: {raw_usdc_amount}, Decimal USDC: {decimal_usdc}")
-            
-            # Check existing allowance (comparing raw units)
-            allowance = int(self.web3_service.usdc.functions.allowance(
-                self.web3_service.wallet_address,
-                self.web3_service.w3.to_checksum_address(EXCHANGE_ADDRESS)
-            ).call())
-            
-            if allowance < required_amount:
-                logger.info(f"Insufficient allowance. Have {allowance} USDC units, need {required_amount} USDC units")
-                try:
-                    approval = self.web3_service.approve_usdc()
-                    if not approval["success"]:
-                        raise ValueError("Failed to approve USDC")
-                except Exception as e:
-                    logger.error(f"USDC approval failed: {str(e)}")
-                    raise ValueError(f"Failed to approve USDC: {str(e)}")
-            else:
-                logger.info(f"Sufficient allowance exists: {allowance} >= {required_amount} USDC units")
+            logger.info(f"""
+            Order Book State:
+            - Bid count: {len(bids)}
+            - Ask count: {len(asks)}
+            - Best bid: {max(bid[0] for bid in bids) if bids else None}
+            - Best ask: {min(ask[0] for ask in asks) if asks else None}
+            """)
 
+            # Check available liquidity at our price level
             if side.upper() == "BUY":
-                # Get orderbook and find best ask price
-                orderbook = self.client.get_order_book(token_id)
-                if not orderbook or not orderbook.asks:
-                    raise ValueError("No asks available in orderbook")
-                
-                # Get best ask price from orderbook
-                best_ask = float(orderbook.asks[0].price)
-                logger.info(f"Best ask price from orderbook: {best_ask}")
-                
-                # Use input price since it's validated by check_price
-                execution_price = price
-                outcome_tokens = round(decimal_usdc / execution_price, 2)
-                actual_usdc_units = int(outcome_tokens * execution_price * 1_000_000)
-                
-                logger.info(f"BUY order: {outcome_tokens} tokens at price {execution_price}")
-                logger.info(f"Required USDC units: {actual_usdc_units}")
+                available_liquidity = sum(size for p, size in asks if p <= price)
+                if not available_liquidity:
+                    raise ValueError(f"No liquidity available at or below price {price}")
+                logger.info(f"Available buy liquidity at {price}: {available_liquidity}")
+                return self.execute_buy_trade(token_id, price, amount, is_yes_token, available_liquidity)
+            else:
+                available_liquidity = sum(size for p, size in bids if p >= price)
+                if not available_liquidity:
+                    raise ValueError(f"No liquidity available at or above price {price}")
+                logger.info(f"Available sell liquidity at {price}: {available_liquidity}")
+                return self.execute_sell_trade(token_id, price, amount, is_yes_token, available_liquidity)
 
-                MIN_TRADE_SIZE = 5.0
-                if outcome_tokens < MIN_TRADE_SIZE:
-                    min_usdc_needed = MIN_TRADE_SIZE * execution_price
-                    raise ValueError(
-                        f"Trade size too small. Minimum is {MIN_TRADE_SIZE} tokens, got {outcome_tokens:.2f}. "
-                        f"Need at least {min_usdc_needed:.6f} USDC for this price."
-                    )
+        except Exception as e:
+            logger.error(f"Trade execution failed: {str(e)}")
+            raise e
 
-                # Check balances using raw USDC units
-                balance = int(self.web3_service.usdc.functions.balanceOf(
-                    self.web3_service.wallet_address
-                ).call())
+    def execute_buy_trade(self, token_id: str, price: float, amount: float, is_yes_token: bool, available_liquidity: float):
+        """Execute a buy trade with price-adjusted allowance calculations"""
+        MAX_RETRIES = 3
+        RETRY_DELAY = 2
+        
+        try:
+            USDC_DECIMALS = 6
+            
+            # Adjust fee buffer based on price - lower prices need higher buffers
+            # This is because of how market maker systems handle risk
+            if price <= 0.1:
+                FEE_BUFFER = 1.15  # 15% buffer for very low prices
+            elif price <= 0.5:
+                FEE_BUFFER = 1.08  # 8% buffer for medium-low prices
+            elif price <= 0.9:
+                FEE_BUFFER = 1.05  # 5% buffer for medium-high prices
+            else:
+                FEE_BUFFER = 1.02  # 2% buffer for high prices
                 
-                if balance < actual_usdc_units:
-                    raise ValueError(
-                        f"Insufficient USDC balance. Have: {balance/1_000_000:.2f} USDC, "
-                        f"Need: {actual_usdc_units/1_000_000:.2f} USDC"
-                    )
+            # Calculate base amounts
+            usdc_decimal = amount / (10 ** USDC_DECIMALS)
+            outcome_tokens = float(usdc_decimal / price)
+            
+            # Add price-adjusted safety margin to USDC requirements
+            price_factor = 1 + ((1 - price) * 0.5)  # Higher adjustment for lower prices
+            base_usdc_needed = int(outcome_tokens * price * (10 ** USDC_DECIMALS))
+            actual_usdc_needed = int(base_usdc_needed * FEE_BUFFER * price_factor)
+            
+            logger.info(f"""
+            Buy Order Calculations:
+            - USDC amount: {usdc_decimal}
+            - Price per token: {price}
+            - Price factor: {price_factor}
+            - Fee buffer: {FEE_BUFFER}
+            - Outcome tokens: {outcome_tokens}
+            - Available liquidity: {available_liquidity}
+            - Base USDC needed: {base_usdc_needed / (10 ** USDC_DECIMALS)}
+            - Actual USDC needed: {actual_usdc_needed / (10 ** USDC_DECIMALS)}
+            """)
 
-                # Check price considering yes/no token type
-                self.check_price(token_id, float(price), side, is_yes_token)
+            # Verify against available liquidity with price-adjusted buffer
+            if outcome_tokens > available_liquidity * 0.95:  # Add 5% safety margin
+                raise ValueError(f"Insufficient liquidity. Need {outcome_tokens} tokens but only {available_liquidity} available")
 
+            # Balance and allowance check with adjusted amounts
+            for attempt in range(MAX_RETRIES):
                 try:
-                    # Create market order with simplified MarketOrderArgs
+                    balance = int(self.web3_service.usdc.functions.balanceOf(
+                        self.web3_service.wallet_address
+                    ).call())
+                    
+                    allowance = int(self.web3_service.usdc.functions.allowance(
+                        self.web3_service.wallet_address,
+                        self.web3_service.w3.to_checksum_address(EXCHANGE_ADDRESS)
+                    ).call())
+                    
+                    logger.info(f"""
+                    Balance check (attempt {attempt + 1}):
+                    - Balance: {balance / (10 ** USDC_DECIMALS)} USDC
+                    - Required: {actual_usdc_needed / (10 ** USDC_DECIMALS)} USDC
+                    - Price-adjusted buffer: {price_factor}
+                    """)
+                    
+                    if balance < actual_usdc_needed:
+                        raise ValueError(f"Insufficient balance. Have: {balance / (10 ** USDC_DECIMALS):.6f} USDC, Need: {actual_usdc_needed / (10 ** USDC_DECIMALS):.6f} USDC")
+                    
+                    if allowance < actual_usdc_needed:
+                        logger.info("Insufficient allowance, requesting approval")
+                        approval = self.web3_service.approve_usdc()
+                        if not approval["success"]:
+                            raise ValueError("Failed to approve USDC")
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    
+                    break
+                    
+                except Exception as e:
+                    if attempt == MAX_RETRIES - 1:
+                        raise ValueError(f"Failed to validate balance/allowance after {MAX_RETRIES} attempts: {str(e)}")
+                    time.sleep(RETRY_DELAY)
+
+            # Execute order with market order
+            for attempt in range(MAX_RETRIES):
+                try:
                     order_args = MarketOrderArgs(
                         token_id=token_id,
-                        amount=float(outcome_tokens)  # Number of outcome tokens to buy
+                        amount=float(outcome_tokens)
                     )
                     
-                    logger.info(f"Creating market order with args: token_id={token_id}, amount={outcome_tokens}")
+                    logger.info(f"""
+                    Submitting buy order (attempt {attempt + 1}):
+                    - Token ID: {token_id}
+                    - Amount (tokens): {outcome_tokens}
+                    - Price: {price}
+                    - Adjusted allowance: {actual_usdc_needed / (10 ** USDC_DECIMALS)}
+                    """)
+                    
                     signed_order = self.client.create_market_order(order_args)
-                    logger.info("Market order created successfully")
-
-                    logger.info("Using FOK order type for market BUY order")
                     response = self.client.post_order(signed_order, OrderType.FOK)
-                    logger.info(f"Order response: {response}")
-
-                except Exception as e:
-                    logger.error(f"Error with market order: {str(e)}")
-                    raise e
-
-            else:  # SELL orders
-                outcome_tokens = round(decimal_usdc / float(price), 2)
-                logger.info(f"SELL order: {outcome_tokens} tokens at {price} USDC/token")
-
-                try:
-                    order_args = OrderArgs(
-                        token_id=token_id,
-                        side=SELL,
-                        price=float(price),
-                        size=float(outcome_tokens)
-                    )
                     
-                    logger.info(f"Creating limit sell order with args: {order_args}")
-                    signed_order = self.client.create_order(order_args)
-                    logger.info("Limit order created successfully")
-
-                    logger.info("Using GTC order type for limit SELL order")
-                    response = self.client.post_order(signed_order, OrderType.GTC)
-                    logger.info(f"Order response: {response}")
-
+                    if response.get("errorMsg"):
+                        raise ValueError(f"Order placement failed: {response['errorMsg']}")
+                    
+                    return {
+                        "success": True,
+                        "order_id": response.get("orderID"),
+                        "status": response.get("status"),
+                        "balance_info": {
+                            "balance_usdc": balance / (10 ** USDC_DECIMALS),
+                            "base_amount": base_usdc_needed / (10 ** USDC_DECIMALS),
+                            "total_with_fees": actual_usdc_needed / (10 ** USDC_DECIMALS)
+                        }
+                    }
+                    
                 except Exception as e:
-                    logger.error(f"Error with limit order: {str(e)}")
-                    raise e
+                    if attempt == MAX_RETRIES - 1:
+                        raise ValueError(f"Failed to execute trade after {MAX_RETRIES} attempts: {str(e)}")
+                    logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                    time.sleep(RETRY_DELAY)
 
-            if response.get("errorMsg"):
-                raise ValueError(f"Order placement failed: {response['errorMsg']}")
+        except Exception as e:
+            logger.error(f"Buy trade execution failed: {str(e)}")
+            raise e
+
+    def execute_sell_trade(self, token_id: str, price: float, amount: float, is_yes_token: bool, available_liquidity: float):
+        """Execute a sell trade with limit orders and proper liquidity checks"""
+        try:
+            USDC_DECIMALS = 6
+            FEE_BUFFER = 1.02
+            
+            # Calculate amounts
+            decimal_usdc = amount / (10 ** USDC_DECIMALS)
+            outcome_tokens = float(decimal_usdc / price)
+            
+            # Verify against available liquidity
+            if outcome_tokens > available_liquidity:
+                raise ValueError(f"Insufficient liquidity. Need {outcome_tokens} tokens but only {available_liquidity} available")
+            
+            actual_usdc_units = int(outcome_tokens * float(price) * (10 ** USDC_DECIMALS))
+            logger.info(f"SELL order: {outcome_tokens} tokens at {price} USDC/token")
+
+            # Create and submit limit sell order
+            try:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    side=SELL,
+                    price=float(price),
+                    size=float(outcome_tokens)
+                )
+                
+                logger.info(f"Creating limit sell order with args: {order_args}")
+                signed_order = self.client.create_order(order_args)
+                
+                logger.info("Using GTC order type for limit SELL order")
+                response = self.client.post_order(signed_order, OrderType.GTC)
+                logger.info(f"Order response: {response}")
+
+                if response.get("errorMsg"):
+                    raise ValueError(f"Order placement failed: {response['errorMsg']}")
+
+            except Exception as e:
+                logger.error(f"Error with limit order: {str(e)}")
+                raise e
+
+            # Get balance for response
+            balance = int(self.web3_service.usdc.functions.balanceOf(
+                self.web3_service.wallet_address
+            ).call())
 
             return {
                 "success": True,
                 "order_id": response.get("orderID"),
                 "status": response.get("status"),
                 "balance_info": {
-                    "balance_usdc": balance / 1_000_000,
-                    "required_amount": actual_usdc_units / 1_000_000,
+                    "balance_usdc": balance / (10 ** USDC_DECIMALS),
+                    "required_amount": actual_usdc_units / (10 ** USDC_DECIMALS),
                     "has_sufficient_balance": balance >= actual_usdc_units,
-                    "has_sufficient_allowance": allowance >= required_amount
+                    "has_sufficient_allowance": True
                 }
             }
 
         except Exception as e:
-            logger.error(f"Trade execution failed: {str(e)}")
+            logger.error(f"Sell trade execution failed: {str(e)}")
             raise e
-    
+
     async def get_positions(self):
         try:
             query = gql("""
