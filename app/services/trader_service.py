@@ -1,7 +1,8 @@
 # src/services/trader_service.py
 import time
+import asyncio
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
@@ -304,67 +305,151 @@ class TraderService:
             logger.error(f"Buy trade execution failed: {str(e)}")
             raise e
 
-    def execute_sell_trade(self, token_id: str, price: float, amount: float, is_yes_token: bool, available_liquidity: float):
-        """Execute a sell trade with limit orders and proper liquidity checks"""
+    async def execute_delegated_sell(self, token_id: str, price: float, amount: int, is_yes_token: bool):
+        """
+        Execute a delegated sell order with complete approval checks, balance verification,
+        and proper order execution.
+        
+        Args:
+            token_id: The market token ID
+            price: The selling price
+            amount: Amount in USDC base units
+            is_yes_token: Whether this is a YES token
+        """
         try:
-            USDC_DECIMALS = 6
-            FEE_BUFFER = 1.02
+            # Step 1: Check all contract approvals
+            approvals = self.web3_service.check_all_approvals()
+            logger.info(f"Current approval status: {approvals}")
             
-            # Calculate amounts
-            decimal_usdc = amount / (10 ** USDC_DECIMALS)
-            outcome_tokens = float(decimal_usdc / price)
+            needs_approval = False
+            for name, status in approvals.items():
+                if not status["ctf_approved"] or status["usdc_allowance"] <= 0:
+                    needs_approval = True
+                    logger.info(f"Missing approvals for {name}")
+                    break
             
-            # Verify against available liquidity
-            if outcome_tokens > available_liquidity:
-                raise ValueError(f"Insufficient liquidity. Need {outcome_tokens} tokens but only {available_liquidity} available")
-            
-            actual_usdc_units = int(outcome_tokens * float(price) * (10 ** USDC_DECIMALS))
-            logger.info(f"SELL order: {outcome_tokens} tokens at {price} USDC/token")
-
-            # Create and submit limit sell order
-            try:
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    side=SELL,
-                    price=float(price),
-                    size=float(outcome_tokens)
-                )
+            if needs_approval:
+                logger.info("Some approvals missing, initiating approval process")
+                approval_result = await self.web3_service.approve_all_contracts()
+                if not approval_result["success"]:
+                    raise ValueError(f"Failed to approve contracts: {approval_result.get('error')}")
+                await asyncio.sleep(3)  # Wait for approvals to propagate
                 
-                logger.info(f"Creating limit sell order with args: {order_args}")
-                signed_order = self.client.create_order(order_args)
+                # Verify approvals again
+                approvals = self.web3_service.check_all_approvals()
+                logger.info(f"Updated approval status: {approvals}")
                 
-                logger.info("Using GTC order type for limit SELL order")
-                response = self.client.post_order(signed_order, OrderType.GTC)
-                logger.info(f"Order response: {response}")
+                for name, status in approvals.items():
+                    if not status["ctf_approved"] or status["usdc_allowance"] <= 0:
+                        raise ValueError(f"Approval failed for {name} after attempt")
 
-                if response.get("errorMsg"):
-                    raise ValueError(f"Order placement failed: {response['errorMsg']}")
+            # Step 2: Check orderbook for liquidity
+            orderbook = self.client.get_order_book(token_id)
+            if not orderbook.bids:
+                raise ValueError("No buy orders available in orderbook")
+            
+            best_bid = float(orderbook.bids[0].price)
+            logger.info(f"Best bid price: {best_bid}")
 
-            except Exception as e:
-                logger.error(f"Error with limit order: {str(e)}")
-                raise e
+            if float(price) < best_bid * 0.99:  # 1% tolerance
+                raise ValueError(f"Sell price ({price}) too low compared to best bid ({best_bid})")
 
-            # Get balance for response
-            balance = int(self.web3_service.usdc.functions.balanceOf(
-                self.web3_service.wallet_address
-            ).call())
+            # Step 3: Calculate amounts and verify balance
+            usdc_decimal = float(amount) / 1_000_000  # Convert from base units
+            tokens_to_sell = usdc_decimal / float(price)
+            
+            # Update and verify balance allowance
+            MAX_RETRIES = 3
+            last_error = None
+            
+            for attempt in range(MAX_RETRIES):
+                try:
+                    # Set up balance params
+                    balance_params = BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=token_id,
+                        signature_type=0
+                    )
+                    
+                    # Force balance allowance update
+                    logger.info(f"Updating balance allowance (attempt {attempt + 1})")
+                    updated_balance = self.client.update_balance_allowance(balance_params)
+                    await asyncio.sleep(2)
+                    
+                    # Verify balance
+                    current_balance = self.client.get_balance_allowance(balance_params)
+                    logger.info(f"Current balance state: {current_balance}")
+                    
+                    if not current_balance or 'balance' not in current_balance:
+                        raise ValueError("Failed to fetch current balance")
+                    
+                    balance = float(current_balance.get('balance', '0'))
+                    
+                    if balance <= 0:
+                        raise ValueError("Insufficient token balance for trade")
+                    
+                    if tokens_to_sell > balance:
+                        raise ValueError(
+                            f"Insufficient balance. Have: {balance}, Need: {tokens_to_sell}"
+                        )
+                    
+                    logger.info(f"""
+                    Trade parameters:
+                    USDC desired: {usdc_decimal}
+                    Price per token: {price}
+                    Best bid price: {best_bid}
+                    Tokens to sell: {tokens_to_sell}
+                    Available balance: {balance}
+                    """)
 
-            return {
-                "success": True,
-                "order_id": response.get("orderID"),
-                "status": response.get("status"),
-                "balance_info": {
-                    "balance_usdc": balance / (10 ** USDC_DECIMALS),
-                    "required_amount": actual_usdc_units / (10 ** USDC_DECIMALS),
-                    "has_sufficient_balance": balance >= actual_usdc_units,
-                    "has_sufficient_allowance": True
-                }
-            }
+                    # Step 4: Create and execute order
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        side=SELL,
+                        price=float(price),
+                        size=float(tokens_to_sell),
+                        fee_rate_bps=0,
+                        nonce=0,
+                        expiration=0
+                    )
+                    
+                    logger.info("Creating signed order")
+                    signed_order = self.client.create_order(order_args)
+                    
+                    logger.info("Submitting order with GTC type")
+                    response = self.client.post_order(signed_order, OrderType.GTC)
+                    
+                    if response.get("errorMsg"):
+                        raise ValueError(f"Order placement failed: {response['errorMsg']}")
+                    
+                    logger.info(f"Order successfully placed: {response}")
+                    
+                    return {
+                        "success": True,
+                        "order_id": response.get("orderID"),
+                        "status": response.get("status"),
+                        "details": {
+                            "tokens_sold": tokens_to_sell,
+                            "expected_usdc": usdc_decimal,
+                            "price": price,
+                            "best_bid": best_bid,
+                            "transaction_hashes": response.get("transactionsHashes", [])
+                        }
+                    }
+
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"Attempt {attempt + 1} failed: {last_error}")
+                    
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(3)  # Wait before retry
+                        continue
+                    raise ValueError(f"Failed after {MAX_RETRIES} attempts. Last error: {last_error}")
 
         except Exception as e:
-            logger.error(f"Sell trade execution failed: {str(e)}")
-            raise e
-
+            logger.error(f"Delegated sell execution failed: {str(e)}")
+            raise ValueError(str(e))
+    
     async def get_positions(self):
         try:
             query = gql("""

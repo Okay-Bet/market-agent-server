@@ -10,6 +10,7 @@ from .api.routes.status import router as status_router
 from .api.routes.positions import router as positions_router
 from .api.routes.orders import router as orders_router
 from .api.routes.delegated_orders import router as delegated_orders_router
+from .api.routes.delegated_sell import router as delegated_sell_router
 
 # Setup logging and env variables
 load_dotenv()
@@ -34,6 +35,7 @@ app.include_router(status_router)
 app.include_router(positions_router)
 app.include_router(orders_router)
 app.include_router(delegated_orders_router)
+app.include_router(delegated_sell_router)
 
 if __name__ == "__main__":
     import uvicorn
