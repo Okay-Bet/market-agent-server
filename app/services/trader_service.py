@@ -356,11 +356,8 @@ class TraderService:
                     balances = [0.0] * outcome_count
                     outcome_index = int(balance['asset']['outcomeIndex'])
                     raw_balance = int(balance['balance'])
-                    converted_balance = raw_balance / 1e6
-                    
-                    print(f"Converting balance {raw_balance} to {converted_balance}")
-                    
-                    balances[outcome_index] = converted_balance
+                                        
+                    balances[outcome_index] = raw_balance
                     
                     position = Position(
                         market_id=str(market_info["id"]),
