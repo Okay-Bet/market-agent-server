@@ -50,19 +50,14 @@ async def submit_delegated_sell(order: OrderRequest):
                 token_id=order.token_id,
                 price=price,
                 amount=amount,
-                is_yes_token=order.is_yes_token
+                is_yes_token=order.is_yes_token,
+                user_address=order.user_address
             )
-            
             return JSONResponse(content=result)
-
         except ValueError as e:
             # Convert known trading errors to appropriate HTTP responses
             error_msg = str(e).lower()
-            if "insufficient" in error_msg:
-                raise HTTPException(status_code=400, detail=str(e))
-            elif "liquidity" in error_msg:
-                raise HTTPException(status_code=400, detail=str(e))
-            elif "balance" in error_msg:
+            if any(keyword in error_msg for keyword in ["insufficient", "liquidity", "balance"]):
                 raise HTTPException(status_code=400, detail=str(e))
             else:
                 raise HTTPException(status_code=500, detail=str(e))
