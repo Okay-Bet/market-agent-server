@@ -2,8 +2,8 @@
 import os
 from dotenv import load_dotenv
 import logging
-
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,8 @@ SUBGRAPH_URL = 'https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li
 USDC_ABI = [
     {"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"}
+    {"inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"}
 ]
 
 CTF_ABI = [
@@ -36,6 +37,26 @@ CTF_ABI = [
         "name": "balanceOf",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "operator", "type": "address"}
+        ],
+        "name": "isApprovedForAll",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"}
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
         "type": "function"
     }
 ]

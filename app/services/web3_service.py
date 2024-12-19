@@ -1,3 +1,4 @@
+# src/services/web3_service.py
 from web3 import Web3
 import asyncio
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -24,43 +25,60 @@ class Web3Service:
             'neg_risk_adapter': '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
         }
 
-        self.ctf_abi = [
-            {
-                "inputs": [
-                    {"name": "operator", "type": "address"},
-                    {"name": "approved", "type": "bool"}
-                ],
-                "name": "setApprovalForAll",
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "nonpayable",
-                "type": "function"
-            },
-            {
-                "inputs": [
-                    {"name": "owner", "type": "address"},
-                    {"name": "operator", "type": "address"}
-                ],
-                "name": "isApprovedForAll",
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "view",
-                "type": "function"
-            }
-        ]
-
         self.ctf = self.w3.eth.contract(
             address=Web3.to_checksum_address(CTF_ADDRESS),
-            abi=self.ctf_abi
+            abi=CTF_ABI
         )
 
-        self.erc20_abi = [
-            {
-                "constant": True,
-                "inputs": [{"name": "_owner", "type": "address"}],
-                "name": "balanceOf",
-                "outputs": [{"name": "balance", "type": "uint256"}],
-                "type": "function"
+    async def transfer_usdc(self, to_address: str, amount: int) -> dict:
+        """
+        Transfer USDC to a specified address
+        
+        Args:
+            to_address: Recipient address
+            amount: Amount in USDC base units (6 decimals)
+        """
+        try:
+            logger.info(f"Initiating USDC transfer to {to_address} of {amount} units")
+            
+            # Get current gas prices
+            base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
+            priority_fee = 50_000_000_000  # 50 gwei
+            max_fee = base_fee * 4 + priority_fee
+
+            # Build transaction
+            txn = self.usdc.functions.transfer(
+                self.w3.to_checksum_address(to_address),
+                amount
+            ).build_transaction({
+                'chainId': 137,
+                'gas': 100000,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                'from': self.wallet_address
+            })
+
+            # Sign and send transaction
+            signed_txn = self.w3.eth.account.sign_transaction(txn, PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            
+            # Wait for transaction receipt with increased timeout
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+            if receipt['status'] != 1:
+                raise ValueError("Transfer transaction failed")
+
+            return {
+                "success": True,
+                "transaction_hash": receipt['transactionHash'].hex(),
+                "amount_transferred": amount,
+                "recipient": to_address
             }
-        ]
+            
+        except Exception as e:
+            logger.error(f"USDC transfer failed: {str(e)}")
+            raise ValueError(f"Failed to transfer USDC: {str(e)}")
 
     def approve_usdc(self):
         try:
@@ -87,7 +105,6 @@ class Web3Service:
             signed_txn = self.w3.eth.account.sign_transaction(txn, PRIVATE_KEY)
             tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
             
-            # Increase timeout to 300 seconds
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
             if receipt['status'] != 1:
@@ -100,57 +117,6 @@ class Web3Service:
         except Exception as e:
             logger.error(f"USDC approval failed: {str(e)}")
             raise ValueError(f"Failed to approve USDC: {str(e)}")
-
-    async def verify_usdc_transaction(self, tx_hash: str, expected_amount: float,
-                                    from_address: str, to_address: str) -> dict:
-        try:
-            logger.info(f"Verifying USDC transfer: {tx_hash}")
-            tx_receipt = self.w3.eth.get_transaction_receipt(tx_hash)
-            
-            if not tx_receipt or not tx_receipt['status']:
-                logger.error(f"Transaction failed or not found: {tx_hash}")
-                return {
-                    'success': False,
-                    'error': 'Transaction failed or not found'
-                }
-
-            # Verify the transaction details
-            tx = self.w3.eth.get_transaction(tx_hash)
-            if (tx['from'].lower() != from_address.lower() or
-                tx['to'].lower() != self.usdc.address.lower()):
-                logger.error(f"Invalid transaction addresses. From: {tx['from']}, To: {tx['to']}")
-                return {
-                    'success': False,
-                    'error': 'Invalid transaction addresses'
-                }
-
-            # Decode transfer event
-            transfer_events = self.usdc.events.Transfer().process_receipt(tx_receipt)
-            if not transfer_events:
-                logger.error("No Transfer event found in transaction")
-                return {
-                    'success': False,
-                    'error': 'No Transfer event found'
-                }
-
-            transfer_event = transfer_events[0]
-            amount = float(transfer_event['args']['value']) / 1e6  # Convert from USDC decimals
-            
-            logger.info(f"Transfer amount: {amount}, Expected: {expected_amount}")
-            
-            if abs(amount - expected_amount) > 0.01:  # Allow 1% deviation
-                logger.error(f"Invalid transfer amount. Expected: {expected_amount}, Got: {amount}")
-                return {
-                    'success': False,
-                    'error': f'Invalid transfer amount. Expected: {expected_amount}, Got: {amount}'
-                }
-
-            logger.info("USDC transfer verification successful")
-            return {'success': True}
-            
-        except Exception as e:
-            logger.error(f"USDC verification failed: {str(e)}")
-            return {'success': False, 'error': str(e)}
 
     async def approve_all_contracts(self):
         """Approve all required contracts for both USDC and CTF"""
@@ -165,7 +131,6 @@ class Web3Service:
                     logger.info(f"Approving USDC for {name}")
                     max_amount = int("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
                     
-                    # Get current allowance
                     current_allowance = self.usdc.functions.allowance(
                         self.wallet_address,
                         self.w3.to_checksum_address(address)
@@ -200,45 +165,6 @@ class Web3Service:
                 
                 except Exception as e:
                     logger.error(f"USDC approval failed for {name}: {str(e)}")
-                    raise
-
-                # Approve CTF
-                try:
-                    logger.info(f"Approving CTF for {name}")
-                    is_approved = self.ctf.functions.isApprovedForAll(
-                        self.wallet_address,
-                        self.w3.to_checksum_address(address)
-                    ).call()
-                    
-                    if not is_approved:
-                        base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
-                        priority_fee = 50_000_000_000
-                        max_fee = base_fee * 4 + priority_fee
-
-                        txn = self.ctf.functions.setApprovalForAll(
-                            self.w3.to_checksum_address(address),
-                            True
-                        ).build_transaction({
-                            'chainId': 137,
-                            'gas': 100000,
-                            'maxFeePerGas': max_fee,
-                            'maxPriorityFeePerGas': priority_fee,
-                            'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
-                            'from': self.wallet_address
-                        })
-
-                        signed_txn = self.w3.eth.account.sign_transaction(txn, PRIVATE_KEY)
-                        tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-                        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
-                        
-                        if receipt['status'] != 1:
-                            raise ValueError(f"CTF approval failed for {name}")
-                        
-                        logger.info(f"CTF approval successful for {name}")
-                        await asyncio.sleep(2)  # Wait for approval to propagate
-                
-                except Exception as e:
-                    logger.error(f"CTF approval failed for {name}: {str(e)}")
                     raise
 
             return {"success": True}

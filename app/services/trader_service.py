@@ -306,7 +306,7 @@ class TraderService:
             logger.error(f"Buy trade execution failed: {str(e)}")
             raise e
 
-    async def execute_delegated_sell(self, token_id: str, price: float, amount: int, is_yes_token: bool, user_address: str = None):
+    async def execute_delegated_sell(self, token_id: str, price: float, amount: int, is_yes_token: bool, user_address: str):
             """Delegate sell execution to SellService
             Note: user_address parameter is kept optional for backward compatibility
             """
@@ -314,7 +314,8 @@ class TraderService:
                 token_id=token_id,
                 price=price,
                 amount=amount,
-                is_yes_token=is_yes_token
+                is_yes_token=is_yes_token,
+                user_address=user_address
             )
 
     async def get_positions(self):

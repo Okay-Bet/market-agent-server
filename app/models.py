@@ -1,14 +1,16 @@
 # src/models.py
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, confloat, conint
 from typing import List, Optional, Literal
+from enum import Enum
+
 
 class OrderRequest(BaseModel):
-    user_address: str
+    user_address: str = Field(..., description="Ethereum address of the user")
     token_id: str
-    price: float  
-    amount: float  
     side: str
-    is_yes_token: bool 
+    price: confloat(gt=0, lt=1) = Field(description="Price must be between 0 and 1")
+    amount: conint(gt=0) = Field(description="Amount must be a positive integer")
+    is_yes_token: bool
 
 class Position(BaseModel):
     market_id: str
