@@ -38,20 +38,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Startup and shutdown events
 @app.on_event("startup")
-async def startup_event():
-    global market_resolution_service
+def startup_event():
     try:
-        # Create database tables
         logger.info("Creating database tables...")
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created successfully")
-
-        # Initialize and start the market resolution service
-        market_resolution_service = MarketResolutionService(web3_service, postgres_service)
-        market_resolution_service.start()
-        logger.info("Market resolution service started successfully")
     except Exception as e:
         logger.error(f"Failed to start services: {str(e)}")
         raise

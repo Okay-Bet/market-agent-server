@@ -61,19 +61,15 @@ async def submit_delegated_order(order: OrderRequest):
     
 
 @router.get("/api/user-orders/{address}")
-async def get_user_orders(address: str):
+async def get_user_orders(address: str):  # Make route async
     try:
-        # Await both async calls
-        pending_orders = await postgres_service.get_user_pending_orders(address)
+        # This stays synchronous
+        pending_orders = postgres_service.get_user_pending_orders(address)
+        # This needs await since it's async
         completed_orders = await trader_service.get_positions()
-
-        # Dict conversion for JSON serialization
-        return JSONResponse(content={
-            "pending_orders": pending_orders,
-            "completed_orders": [order.dict() for order in completed_orders]
-        })
+        return {"pending_orders": pending_orders, "completed_orders": completed_orders}
     except Exception as e:
-        logger.error(f"Error in get_user_orders: {str(e)}")
+        logger.error(f"Error getting user orders: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/api/order-status/{order_id}")
