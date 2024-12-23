@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from ...services.trader_service import TraderService
-from ...models import OrderRequest
+from ...models.api import OrderRequest
 from ...config import logger
 
 router = APIRouter()

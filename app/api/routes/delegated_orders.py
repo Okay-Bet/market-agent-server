@@ -1,14 +1,14 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from ...services.trader_service import TraderService
-from ...services.redis_service import RedisService
+from ...services.postgres_service import PostgresService
 from ...services.web3_service import Web3Service
-from ...models import OrderRequest, OrderStatus
+from ...models.api import OrderRequest, OrderStatus
 from ...config import logger
 
 router = APIRouter()
 trader_service = TraderService()
-redis_service = RedisService()
+postgres_service = PostgresService()
 web3_service = Web3Service()
 
 @router.post("/api/delegated-order")
@@ -63,30 +63,24 @@ async def submit_delegated_order(order: OrderRequest):
 @router.get("/api/user-orders/{address}")
 async def get_user_orders(address: str):
     try:
-        print(f"Received request for address: {address}")  # Debug log
-        
-        # Get pending orders from Redis
-        pending_orders = redis_service.get_user_pending_orders(address)
-        print(f"Pending orders: {pending_orders}")  # Debug log
-
-        # Get completed orders from subgraph
+        # Await both async calls
+        pending_orders = await postgres_service.get_user_pending_orders(address)
         completed_orders = await trader_service.get_positions()
-        print(f"Completed orders: {completed_orders}")  # Debug log
 
+        # Dict conversion for JSON serialization
         return JSONResponse(content={
             "pending_orders": pending_orders,
             "completed_orders": [order.dict() for order in completed_orders]
         })
-
     except Exception as e:
-        print(f"Error in get_user_orders: {str(e)}")  # Debug log
+        logger.error(f"Error in get_user_orders: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/api/order-status/{order_id}")
 async def get_order_status(order_id: str):
     try:
         logger.info(f"Checking status for order: {order_id}")
-        order = redis_service.get_order(order_id)
+        order = postgres_service.get_order(order_id)
         
         if not order:
             logger.warning(f"Order not found: {order_id}")

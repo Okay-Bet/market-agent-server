@@ -8,7 +8,7 @@ from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
 import ast
 from ..config import PRIVATE_KEY, SUBGRAPH_URL, logger, EXCHANGE_ADDRESS
-from ..models import Position
+from ..models.api import Position
 from .sell_service import SellService
 from .web3_service import Web3Service
 from .market_service import MarketService

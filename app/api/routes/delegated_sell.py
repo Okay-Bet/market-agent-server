@@ -1,14 +1,14 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from ...services.trader_service import TraderService
-from ...services.redis_service import RedisService
+from ...services.postgres_service import PostgresService
 from ...services.web3_service import Web3Service
-from ...models import OrderRequest
+from ...models.api import OrderRequest
 from ...config import logger
 
 router = APIRouter()
 trader_service = TraderService()
-redis_service = RedisService()
+postgres_service = PostgresService()
 web3_service = Web3Service()
 
 @router.post("/api/delegated-sell")

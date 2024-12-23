@@ -1,5 +1,5 @@
 from redis import Redis
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json
 import hashlib
 from ..config import logger
@@ -64,3 +64,132 @@ class RedisService:
             if order and order['status'] == 'pending':
                 orders.append(order)
         return orders
+
+    async def get_unresolved_markets(self) -> List[Dict]:
+        """Get all unresolved markets"""
+        try:
+            # Get all market keys with unresolved status
+            market_keys = self.redis.keys('market:*:status')
+            unresolved_markets = []
+            
+            for key in market_keys:
+                status = self.redis.get(key)
+                if status == b'unresolved':
+                    condition_id = key.decode().split(':')[1]
+                    market_data = self.redis.hgetall(f'market:{condition_id}')
+                    if market_data:
+                        unresolved_markets.append({
+                            'condition_id': condition_id,
+                            **{k.decode(): v.decode() for k, v in market_data.items()}
+                        })
+            
+            return unresolved_markets
+        except Exception as e:
+            logger.error(f"Failed to get unresolved markets: {str(e)}")
+            return []
+
+    async def get_market_positions(self, condition_id: str) -> List[Dict]:
+        """Get all positions for a market"""
+        try:
+            position_keys = self.redis.smembers(f'market:{condition_id}:positions')
+            positions = []
+            
+            for key in position_keys:
+                position_data = self.redis.hgetall(key.decode())
+                if position_data:
+                    positions.append({
+                        k.decode(): v.decode() for k, v in position_data.items()
+                    })
+            
+            return positions
+        except Exception as e:
+            logger.error(f"Failed to get positions for market {condition_id}: {str(e)}")
+            return []
+
+    async def mark_position_redeemed(
+        self, 
+        condition_id: str, 
+        user_address: str, 
+        transaction_data: Dict
+    ):
+        """Mark a position as redeemed"""
+        try:
+            key = f'position:{condition_id}:{user_address}'
+            updates = {
+                'status': 'redeemed',
+                'redemption_tx': transaction_data.get('redemption_tx', ''),
+                'transfer_tx': transaction_data.get('transfer_tx', ''),
+                'amount_transferred': str(transaction_data.get('amount_transferred', 0)),
+                'redeemed_at': str(int(time.time()))
+            }
+            self.redis.hmset(key, updates)
+        except Exception as e:
+            logger.error(f"Failed to mark position as redeemed: {str(e)}")
+            raise
+
+    async def mark_market_resolved(
+        self, 
+        condition_id: str, 
+        winning_outcome: int, 
+        metadata: Dict
+    ):
+        """Mark a market as resolved"""
+        try:
+            # Update market status
+            self.redis.set(f'market:{condition_id}:status', 'resolved')
+            
+            # Update market data
+            updates = {
+                'status': 'resolved',
+                'winning_outcome': str(winning_outcome),
+                'resolved_at': str(metadata.get('timestamp', int(time.time()))),
+                'processed_at': str(metadata.get('processed_at', int(time.time())))
+            }
+            self.redis.hmset(f'market:{condition_id}', updates)
+        except Exception as e:
+            logger.error(f"Failed to mark market as resolved: {str(e)}")
+            raise
+
+    async def store_market_position(
+        self,
+        condition_id: str,
+        user_address: str,
+        position_data: Dict
+    ):
+        """Store a new market position"""
+        try:
+            # Create position key
+            position_key = f'position:{condition_id}:{user_address}'
+            
+            # Prepare position data
+            position = {
+                'user_address': user_address,
+                'condition_id': condition_id,
+                'collateral_token': position_data['collateral_token'],
+                'outcome': str(position_data['outcome']),
+                'amount': str(position_data['amount']),
+                'status': 'active',
+                'created_at': str(int(time.time()))
+            }
+            
+            # Store position data
+            self.redis.hmset(position_key, position)
+            
+            # Add to market's position set
+            self.redis.sadd(f'market:{condition_id}:positions', position_key)
+            
+            # Mark market as unresolved if not already set
+            if not self.redis.exists(f'market:{condition_id}:status'):
+                self.redis.set(f'market:{condition_id}:status', 'unresolved')
+                
+            # Store basic market data if not exists
+            if not self.redis.exists(f'market:{condition_id}'):
+                self.redis.hmset(f'market:{condition_id}', {
+                    'condition_id': condition_id,
+                    'status': 'unresolved',
+                    'created_at': str(int(time.time()))
+                })
+                
+        except Exception as e:
+            logger.error(f"Failed to store market position: {str(e)}")
+            raise
