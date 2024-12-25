@@ -183,124 +183,50 @@ class TraderService:
             raise e
 
     def execute_buy_trade(self, token_id: str, price: float, amount: float, is_yes_token: bool, available_liquidity: float):
-        """Execute a buy trade with price-adjusted allowance calculations"""
-        MAX_RETRIES = 3
-        RETRY_DELAY = 2
+        """
+        Execute a buy trade with the exact USDC amount received from user
         
+        Args:
+            token_id (str): Market token identifier
+            price (float): Target price per outcome token
+            amount (float): Amount in decimal USDC
+            is_yes_token (bool): Whether this is a YES token
+            available_liquidity (float): Available liquidity at the price level
+        """
         try:
-            USDC_DECIMALS = 6
-            
-            # Adjust fee buffer based on price - lower prices need higher buffers
-            # This is because of how market maker systems handle risk
-            if price <= 0.1:
-                FEE_BUFFER = 1.15  # 15% buffer for very low prices
-            elif price <= 0.5:
-                FEE_BUFFER = 1.08  # 8% buffer for medium-low prices
-            elif price <= 0.9:
-                FEE_BUFFER = 1.05  # 5% buffer for medium-high prices
-            else:
-                FEE_BUFFER = 1.02  # 2% buffer for high prices
-                
-            # Calculate base amounts
-            usdc_decimal = amount / (10 ** USDC_DECIMALS)
-            outcome_tokens = float(usdc_decimal / price)
-            
-            # Add price-adjusted safety margin to USDC requirements
-            price_factor = 1 + ((1 - price) * 0.5)  # Higher adjustment for lower prices
-            base_usdc_needed = int(outcome_tokens * price * (10 ** USDC_DECIMALS))
-            actual_usdc_needed = int(base_usdc_needed * FEE_BUFFER * price_factor)
+            # Calculate the number of outcome tokens to buy
+            token_amount = amount / price
             
             logger.info(f"""
-            Buy Order Calculations:
-            - USDC amount: {usdc_decimal}
-            - Price per token: {price}
-            - Price factor: {price_factor}
-            - Fee buffer: {FEE_BUFFER}
-            - Outcome tokens: {outcome_tokens}
-            - Available liquidity: {available_liquidity}
-            - Base USDC needed: {base_usdc_needed / (10 ** USDC_DECIMALS)}
-            - Actual USDC needed: {actual_usdc_needed / (10 ** USDC_DECIMALS)}
+            Buy Order Details:
+            - Token Amount: {token_amount}
+            - USDC Amount: {amount}
+            - Price: {price}
+            - Token ID: {token_id}
             """)
 
-            # Verify against available liquidity with price-adjusted buffer
-            if outcome_tokens > available_liquidity * 0.95:  # Add 5% safety margin
-                raise ValueError(f"Insufficient liquidity. Need {outcome_tokens} tokens but only {available_liquidity} available")
-
-            # Balance and allowance check with adjusted amounts
-            for attempt in range(MAX_RETRIES):
-                try:
-                    balance = int(self.web3_service.usdc.functions.balanceOf(
-                        self.web3_service.wallet_address
-                    ).call())
-                    
-                    allowance = int(self.web3_service.usdc.functions.allowance(
-                        self.web3_service.wallet_address,
-                        self.web3_service.w3.to_checksum_address(EXCHANGE_ADDRESS)
-                    ).call())
-                    
-                    logger.info(f"""
-                    Balance check (attempt {attempt + 1}):
-                    - Balance: {balance / (10 ** USDC_DECIMALS)} USDC
-                    - Required: {actual_usdc_needed / (10 ** USDC_DECIMALS)} USDC
-                    - Price-adjusted buffer: {price_factor}
-                    """)
-                    
-                    if balance < actual_usdc_needed:
-                        raise ValueError(f"Insufficient balance. Have: {balance / (10 ** USDC_DECIMALS):.6f} USDC, Need: {actual_usdc_needed / (10 ** USDC_DECIMALS):.6f} USDC")
-                    
-                    if allowance < actual_usdc_needed:
-                        logger.info("Insufficient allowance, requesting approval")
-                        approval = self.web3_service.approve_usdc()
-                        if not approval["success"]:
-                            raise ValueError("Failed to approve USDC")
-                        time.sleep(RETRY_DELAY)
-                        continue
-                    
-                    break
-                    
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        raise ValueError(f"Failed to validate balance/allowance after {MAX_RETRIES} attempts: {str(e)}")
-                    time.sleep(RETRY_DELAY)
-
-            # Execute order with market order
-            for attempt in range(MAX_RETRIES):
-                try:
-                    order_args = MarketOrderArgs(
-                        token_id=token_id,
-                        amount=float(outcome_tokens)
-                    )
-                    
-                    logger.info(f"""
-                    Submitting buy order (attempt {attempt + 1}):
-                    - Token ID: {token_id}
-                    - Amount (tokens): {outcome_tokens}
-                    - Price: {price}
-                    - Adjusted allowance: {actual_usdc_needed / (10 ** USDC_DECIMALS)}
-                    """)
-                    
-                    signed_order = self.client.create_market_order(order_args)
-                    response = self.client.post_order(signed_order, OrderType.FOK)
-                    
-                    if response.get("errorMsg"):
-                        raise ValueError(f"Order placement failed: {response['errorMsg']}")
-                    
-                    return {
-                        "success": True,
-                        "order_id": response.get("orderID"),
-                        "status": response.get("status"),
-                        "balance_info": {
-                            "balance_usdc": balance / (10 ** USDC_DECIMALS),
-                            "base_amount": base_usdc_needed / (10 ** USDC_DECIMALS),
-                            "total_with_fees": actual_usdc_needed / (10 ** USDC_DECIMALS)
-                        }
-                    }
-                    
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        raise ValueError(f"Failed to execute trade after {MAX_RETRIES} attempts: {str(e)}")
-                    logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-                    time.sleep(RETRY_DELAY)
+            # Create and execute market order
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=float(token_amount)
+            )
+            
+            signed_order = self.client.create_market_order(order_args)
+            if not signed_order:
+                raise ValueError("Failed to create signed order")
+                
+            response = self.client.post_order(signed_order, OrderType.FOK)
+            if not response:
+                raise ValueError("No response received from order placement")
+            
+            if response.get("errorMsg"):
+                raise ValueError(f"Order placement failed: {response['errorMsg']}")
+            
+            return {
+                "success": True,
+                "order_id": response.get("orderID"),
+                "status": response.get("status")
+            }
 
         except Exception as e:
             logger.error(f"Buy trade execution failed: {str(e)}")
@@ -379,3 +305,151 @@ class TraderService:
         except Exception as e:
             print(f"Error in get_positions: {str(e)}")
             raise ValueError(f"Failed to fetch positions: {str(e)}")
+
+    def calculate_price_impact(self, token_id: str, amount: float, price: float, side: str) -> dict:
+        """
+        Calculate actual price impact and execution details based on orderbook depth.
+        
+        Args:
+            token_id (str): Market token identifier
+            amount (float): USDC amount in decimal format (e.g., 1.0 = 1 USDC)
+            price (float): Target price per token
+            side (str): "BUY" or "SELL"
+            
+        Returns:
+            dict: Detailed impact analysis containing:
+                - token_amount: Number of tokens to trade
+                - available_liquidity: Total available liquidity at any price
+                - executable_liquidity: Available liquidity at acceptable prices
+                - weighted_avg_price: Expected average execution price
+                - price_impact: Calculated price impact as a decimal
+                - execution_possible: Whether full execution is possible
+                - estimated_total: Estimated total USDC needed including impact
+                - levels_used: Number of orderbook levels needed
+                
+        Raises:
+            ValueError: If orderbook can't be fetched or invalid parameters
+        """
+        try:
+            # Input validation
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+            if price <= 0:
+                raise ValueError("Price must be positive")
+            if side not in ["BUY", "SELL"]:
+                raise ValueError("Side must be BUY or SELL")
+
+            # Fetch and validate orderbook
+            orderbook = self.client.get_order_book(token_id)
+            if not orderbook:
+                raise ValueError("Unable to fetch orderbook")
+
+            # Initialize analysis variables
+            token_amount = amount / price  # How many tokens we want
+            total_available_liquidity = 0
+            executable_liquidity = 0
+            total_cost = 0
+            levels_used = 0
+            
+            logger.info(f"""
+            Starting Price Impact Calculation:
+            - Token ID: {token_id}
+            - USDC Amount: {amount}
+            - Target Price: {price}
+            - Side: {side}
+            - Tokens Needed: {token_amount}
+            """)
+
+            if side == "BUY":
+                # For buys, we analyze the ask side of the book
+                # Convert all asks to float and sort by price
+                asks = [(float(a.price), float(a.size)) for a in orderbook.asks]
+                asks.sort(key=lambda x: x[0])  # Sort by price ascending
+                
+                remaining_tokens = token_amount
+                max_acceptable_price = price * 1.50  # Allow up to 50% price impact
+                
+                for level_price, level_size in asks:
+                    total_available_liquidity += level_size
+                    
+                    # Skip levels with prices too high
+                    if level_price > max_acceptable_price:
+                        continue
+                        
+                    executable_liquidity += level_size
+                    
+                    if remaining_tokens > 0:
+                        # Calculate how many tokens we can take from this level
+                        tokens_from_level = min(remaining_tokens, level_size)
+                        total_cost += tokens_from_level * level_price
+                        remaining_tokens -= tokens_from_level
+                        levels_used += 1
+                        
+                        logger.debug(f"""
+                        Processing Level:
+                        - Price: {level_price}
+                        - Size: {level_size}
+                        - Used: {tokens_from_level}
+                        - Remaining Needed: {remaining_tokens}
+                        """)
+
+            else:  # SELL side
+                # For sells, we analyze the bid side of the book
+                bids = [(float(b.price), float(b.size)) for b in orderbook.bids]
+                bids.sort(key=lambda x: x[0], reverse=True)  # Sort by price descending
+                
+                remaining_tokens = token_amount
+                min_acceptable_price = price * 0.50  # Allow up to 50% price impact
+                
+                for level_price, level_size in bids:
+                    total_available_liquidity += level_size
+                    
+                    # Skip levels with prices too low
+                    if level_price < min_acceptable_price:
+                        continue
+                        
+                    executable_liquidity += level_size
+                    
+                    if remaining_tokens > 0:
+                        tokens_from_level = min(remaining_tokens, level_size)
+                        total_cost += tokens_from_level * level_price
+                        remaining_tokens -= tokens_from_level
+                        levels_used += 1
+
+            # Calculate weighted average price and impact
+            tokens_executed = token_amount - remaining_tokens
+            if tokens_executed > 0:
+                weighted_avg_price = total_cost / tokens_executed
+                price_impact = abs(weighted_avg_price - price) / price
+            else:
+                weighted_avg_price = price
+                price_impact = 0
+
+            result = {
+                "token_amount": token_amount,
+                "available_liquidity": total_available_liquidity,
+                "executable_liquidity": executable_liquidity,
+                "weighted_avg_price": weighted_avg_price,
+                "price_impact": price_impact,
+                "execution_possible": executable_liquidity >= token_amount,
+                "estimated_total": total_cost if tokens_executed == token_amount else amount * (1 + price_impact),
+                "levels_used": levels_used,
+                "remaining_tokens": remaining_tokens
+            }
+            
+            logger.info(f"""
+            Price Impact Analysis Result:
+            - Available Liquidity: {result['available_liquidity']:.6f}
+            - Executable Liquidity: {result['executable_liquidity']:.6f}
+            - Weighted Avg Price: {result['weighted_avg_price']:.6f}
+            - Price Impact: {result['price_impact']*100:.2f}%
+            - Execution Possible: {result['execution_possible']}
+            - Estimated Total USDC: {result['estimated_total']:.6f}
+            - Orderbook Levels Used: {result['levels_used']}
+            """)
+            
+            return result
+
+        except Exception as e:
+            logger.error(f"Error calculating price impact: {str(e)}")
+            raise ValueError(f"Failed to calculate price impact: {str(e)}")
