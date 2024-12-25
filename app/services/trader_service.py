@@ -184,38 +184,38 @@ class TraderService:
 
     def execute_buy_trade(self, token_id: str, price: float, amount: float, is_yes_token: bool, available_liquidity: float):
         """
-        Execute a buy trade with the exact USDC amount received from user
+        Execute a buy trade using exact USDC amount from user
         
         Args:
-            token_id (str): Market token identifier
-            price (float): Target price per outcome token
-            amount (float): Amount in decimal USDC
-            is_yes_token (bool): Whether this is a YES token
-            available_liquidity (float): Available liquidity at the price level
+            token_id: Market token identifier
+            price: Target price per outcome token
+            amount: Amount in decimal USDC (what user sent)
+            is_yes_token: Whether this is a YES token position
+            available_liquidity: Available liquidity (not used for market orders)
         """
         try:
-            # Calculate the number of outcome tokens to buy
-            token_amount = amount / price
-            
             logger.info(f"""
             Buy Order Details:
-            - Token Amount: {token_amount}
-            - USDC Amount: {amount}
-            - Price: {price}
-            - Token ID: {token_id}
+            - USDC Amount to spend: {amount}
+            - Target price: {price}
+            - Available liquidity: {available_liquidity}
             """)
 
-            # Create and execute market order
+            # Create market order with USDC amount
             order_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=float(token_amount)
+                amount=amount  # This is USDC amount, not token amount
             )
+            
+            logger.info(f"Creating market order with {amount} USDC")
             
             signed_order = self.client.create_market_order(order_args)
             if not signed_order:
                 raise ValueError("Failed to create signed order")
-                
+            
+            logger.info("Posting order to CLOB")
             response = self.client.post_order(signed_order, OrderType.FOK)
+            
             if not response:
                 raise ValueError("No response received from order placement")
             
