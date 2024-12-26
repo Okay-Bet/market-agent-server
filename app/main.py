@@ -10,6 +10,7 @@ from .api.routes.positions import router as positions_router
 from .api.routes.orders import router as orders_router
 from .api.routes.delegated_orders import router as delegated_orders_router
 from .api.routes.delegated_sell import router as delegated_sell_router
+from .api.routes.resolution import router as resolution_router 
 from .services.web3_service import Web3Service
 from .services.postgres_service import PostgresService
 from .services.market_resolution import MarketResolutionService
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Initialize services
 web3_service = Web3Service()
 postgres_service = PostgresService()
-market_resolution_service = None
+market_resolution_service = MarketResolutionService(web3_service, postgres_service)
 
 # Initialize FastAPI app
 app = FastAPI(title="Polymarket Trading Server")
@@ -39,7 +40,7 @@ app.add_middleware(
 )
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     try:
         logger.info("Creating database tables...")
         Base.metadata.create_all(bind=engine)
@@ -48,16 +49,6 @@ def startup_event():
         logger.error(f"Failed to start services: {str(e)}")
         raise
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    if market_resolution_service:
-        try:
-            market_resolution_service.stop()
-            logger.info("Market resolution service stopped successfully")
-        except Exception as e:
-            logger.error(f"Error stopping market resolution service: {str(e)}")
-
-
 # Include routers
 app.include_router(health_router)
 app.include_router(status_router)
@@ -65,6 +56,7 @@ app.include_router(positions_router)
 app.include_router(orders_router)
 app.include_router(delegated_orders_router)
 app.include_router(delegated_sell_router)
+app.include_router(resolution_router)
 
 if __name__ == "__main__":
     import uvicorn
