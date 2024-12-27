@@ -192,13 +192,25 @@ class PostgresService:
         finally:
             db.close()
 
-    def get_market(self, condition_id: str) -> Optional[Dict]:
+    def get_market(self, identifier: str, by_token_id: bool = False) -> Optional[Dict]:
+        """
+        Retrieves a market by either condition_id or token_id.
+        
+        Args:
+            identifier: The market identifier (either condition_id or token_id)
+            by_token_id: If True, search by token_id instead of condition_id
+        """
         db = self.get_db()
         try:
-            market = db.query(Market).filter(Market.condition_id == condition_id).first()
+            if by_token_id:
+                market = db.query(Market).filter(Market.token_id == identifier).first()
+            else:
+                market = db.query(Market).filter(Market.condition_id == identifier).first()
+                
             if market:
                 return {
                     'condition_id': str(market.condition_id),
+                    'token_id': str(market.token_id) if market.token_id else None,
                     'status': str(market.status),
                     'winning_outcome': int(market.winning_outcome) if market.winning_outcome else None,
                     'market_metadata': market.market_metadata,
@@ -210,19 +222,159 @@ class PostgresService:
             db.close()
 
     def create_market(self, market_data: Dict[str, Any]):
+        """
+        Creates a new market entry with both condition_id and token_id.
+        
+        Args:
+            market_data: Dictionary containing:
+                - condition_id: Market condition ID
+                - token_id: Token ID (optional)
+                - status: Market status
+                - metadata: Market metadata
+        """
         db = self.get_db()
         try:
+            # Extract the token_id from market_data if present
+            token_id = market_data.get('token_id')
+            
             market = Market(
                 condition_id=market_data['condition_id'],
+                token_id=token_id,
                 status=market_data.get('status', 'unresolved'),
+                total_volume_usdc=market_data.get('total_volume_usdc', 0),
                 market_metadata=market_data.get('metadata', {})
             )
             db.add(market)
             db.commit()
+            logger.info(f"Successfully created market {market_data['condition_id']}")
             return str(market.condition_id)
         except Exception as e:
             db.rollback()
             logger.error(f"Failed to create market: {str(e)}")
+            raise
+        finally:
+            db.close()
+
+    def update_market_metadata(self, condition_id: str, metadata: Dict[str, Any]) -> None:
+        """
+        Updates the metadata for an existing market.
+        
+        Args:
+            condition_id: The market's condition ID
+            metadata: Dictionary containing updated market metadata
+        """
+        db = self.get_db()
+        try:
+            market = db.query(Market).filter(Market.condition_id == condition_id).first()
+            if market:
+                # Update metadata while preserving existing fields
+                current_metadata = market.market_metadata or {}
+                updated_metadata = {**current_metadata, **metadata}
+                market.market_metadata = updated_metadata
+                db.commit()
+                logger.info(f"Updated metadata for market {condition_id}")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to update market metadata: {str(e)}")
+            raise
+        finally:
+            db.close()
+
+    def record_position(self, position_data: Dict[str, Any]) -> None:
+        """
+        Records a position ownership after a successful trade.
+        Uses SQLAlchemy session for transaction management.
+        
+        Args:
+            position_data: Dictionary containing:
+                - user_address: Address of position owner
+                - order_id: ID of the executed order
+                - token_id: Market token ID
+                - amount: Position size
+                - price: Entry price
+                - side: Trade side (BUY/SELL)
+        """
+        db = self.get_db()
+        try:
+            # First record/update the position
+            existing_position = db.query(Position).filter(
+                Position.user_address == position_data['user_address'],
+                Position.condition_id == position_data['condition_id'],
+                Position.outcome == position_data['outcome']
+            ).first()
+
+            if existing_position:
+                # Update existing position
+                total_amount = existing_position.amount + position_data['amount']
+                # Calculate new average entry price
+                existing_position.entry_price = (
+                    (existing_position.amount * existing_position.entry_price) +
+                    (position_data['amount'] * position_data['price'])
+                ) / total_amount
+                existing_position.amount = total_amount
+            else:
+                # Create new position
+                new_position = Position(
+                    user_address=position_data['user_address'],
+                    condition_id=position_data['condition_id'],
+                    outcome=position_data['outcome'],
+                    amount=position_data['amount'],
+                    entry_price=position_data['price'],
+                    status='ACTIVE'
+                )
+                db.add(new_position)
+
+            # Record the order
+            order = Order(
+                id=position_data['order_id'],
+                user_address=position_data['user_address'],
+                market_id=position_data['condition_id'],
+                price=position_data['price'],
+                amount=position_data['amount'],
+                side=position_data['side'],
+                status='EXECUTED'
+            )
+            db.add(order)
+
+            db.commit()
+            logger.info(f"Successfully recorded position for user {position_data['user_address']}")
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to record position: {str(e)}")
+            raise
+        finally:
+            db.close()
+
+    def get_user_positions(self, user_address: str) -> List[Dict[str, Any]]:
+        """
+        Retrieves all active positions for a user.
+        
+        Args:
+            user_address: User's blockchain address
+            
+        Returns:
+            List of position dictionaries containing position details
+        """
+        db = self.get_db()
+        try:
+            positions = db.query(Position).filter(
+                Position.user_address == user_address,
+                Position.status == 'ACTIVE'
+            ).all()
+
+            return [{
+                'user_address': pos.user_address,
+                'condition_id': pos.condition_id,
+                'token_id': pos.token_id,
+                'outcome': pos.outcome,
+                'amount': pos.amount,
+                'entry_price': pos.entry_price,
+                'status': pos.status
+            } for pos in positions]
+
+        except Exception as e:
+            logger.error(f"Failed to get user positions: {str(e)}")
             raise
         finally:
             db.close()

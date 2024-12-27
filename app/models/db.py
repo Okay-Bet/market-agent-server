@@ -23,22 +23,30 @@ class User(Base):
     orders = relationship("Order", back_populates="user")
     transactions = relationship("Transaction", back_populates="user")
 
+    
 class Market(Base):
     __tablename__ = 'markets'
-    
-    condition_id = Column(String(66), primary_key=True)
-    status = Column(String(20), nullable=False, default='unresolved')
-    winning_outcome = Column(Integer)
-    resolution_price = Column(Numeric(78, 18))
-    total_volume_usdc = Column(Numeric(78, 18), nullable=False, default=0)
+
+    condition_id = Column(String(256), primary_key=True)
+    token_id = Column(String(256), nullable=True)
+    status = Column(String(20), nullable=False)
+    winning_outcome = Column(Integer, nullable=True)
+    resolution_price = Column(Numeric(78, 18), nullable=True)
+    total_volume_usdc = Column(Numeric(78, 18), nullable=False)
     created_at = Column(DateTime, nullable=False, default=func.now())
-    resolved_at = Column(DateTime)
-    processed_at = Column(DateTime)
-    market_metadata = Column(JSONB)  # Changed from metadata to market_metadata
+    resolved_at = Column(DateTime, nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+    market_metadata = Column(JSONB, nullable=True)
 
     # Relationships
     positions = relationship("Position", back_populates="market")
     transactions = relationship("Transaction", back_populates="market")
+
+    # Add indices for better query performance
+    __table_args__ = (
+        Index('ix_markets_token_id', 'token_id'),
+        Index('ix_markets_status', 'status'),
+    )
 
 # Rest of the models remain unchanged
 class Position(Base):

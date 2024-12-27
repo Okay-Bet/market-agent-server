@@ -1,6 +1,7 @@
 # src/services/trader_service.py
 import time
 import asyncio
+from typing import Dict, Optional
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -144,10 +145,30 @@ class TraderService:
             logger.error(f"Error checking price for token {token_id}: {str(e)}")
             raise e
 
-    def execute_trade(self, token_id: str, price: float, amount: float, side: str, is_yes_token: bool):
-        """Execute a trade with proper order book verification"""
+    def execute_trade(self, token_id: str, price: float, amount: float, side: str, is_yes_token: bool, user_address: str):
+        """Execute a trade with proper order book verification and position recording"""
         try:
-            # Verify order book and liquidity first
+            # First get market info from the subgraph to map token_id to condition_id
+            query = gql("""
+                query GetMarketInfo($tokenId: String!) {
+                    asset(id: $tokenId) {
+                        condition {
+                            id
+                        }
+                        outcomeIndex
+                    }
+                }
+            """)
+            
+            result = self.gql_client.execute(query, variable_values={
+                "tokenId": token_id.lower()
+            })
+            
+            # Extract condition_id and outcome from the result
+            condition_id = result['asset']['condition']['id']
+            outcome = result['asset']['outcomeIndex']
+            
+            # Your existing orderbook verification
             orderbook = self.client.get_order_book(token_id)
             if not orderbook:
                 raise ValueError("Unable to fetch orderbook")
@@ -155,28 +176,33 @@ class TraderService:
             # Convert bid/ask lists to floats for easier comparison
             bids = [(float(b.price), float(b.size)) for b in orderbook.bids] if orderbook.bids else []
             asks = [(float(a.price), float(a.size)) for a in orderbook.asks] if orderbook.asks else []
-            
-            logger.info(f"""
-            Order Book State:
-            - Bid count: {len(bids)}
-            - Ask count: {len(asks)}
-            - Best bid: {max(bid[0] for bid in bids) if bids else None}
-            - Best ask: {min(ask[0] for ask in asks) if asks else None}
-            """)
 
-            # Check available liquidity at our price level
+            # Execute trade based on side
             if side.upper() == "BUY":
                 available_liquidity = sum(size for p, size in asks if p <= price)
                 if not available_liquidity:
                     raise ValueError(f"No liquidity available at or below price {price}")
-                logger.info(f"Available buy liquidity at {price}: {available_liquidity}")
-                return self.execute_buy_trade(token_id, price, amount, is_yes_token, available_liquidity)
+                result = self.execute_buy_trade(token_id, price, amount, is_yes_token, available_liquidity)
             else:
                 available_liquidity = sum(size for p, size in bids if p >= price)
                 if not available_liquidity:
                     raise ValueError(f"No liquidity available at or above price {price}")
-                logger.info(f"Available sell liquidity at {price}: {available_liquidity}")
-                return self.execute_sell_trade(token_id, price, amount, is_yes_token, available_liquidity)
+                result = self.execute_sell_trade(token_id, price, amount, is_yes_token, available_liquidity)
+
+            # If trade successful, record position
+            if result.get('success'):
+                self.postgres_service.record_position({
+                    'user_address': user_address,
+                    'order_id': result['order_id'],
+                    'token_id': token_id,
+                    'condition_id': condition_id,
+                    'outcome': int(outcome),
+                    'amount': amount,
+                    'price': price,
+                    'side': side
+                })
+
+            return result
 
         except Exception as e:
             logger.error(f"Trade execution failed: {str(e)}")
@@ -244,10 +270,15 @@ class TraderService:
                 user_address=user_address
             )
 
-    async def get_positions(self):
+    async def get_positions(self, user_address: Optional[str] = None):
+        """
+        Get positions with optional user filtering.
+        When user_address is provided, returns only positions owned by that user.
+        """
         try:
+            # Get all agent positions from subgraph (source of truth)
             query = gql("""
-                query GetPositions($address: String!) {
+                query Get_create_position_from_balancePositions($address: String!) {
                     userBalances(where: {user: $address}) {
                         asset {
                             id
@@ -266,44 +297,40 @@ class TraderService:
                 "address": self.web3_service.wallet_address.lower()
             })
             
-            print(f"Raw query result: {result}")  # Debug log
-            
             positions = []
+            
+            # If no user specified, return all positions
+            if not user_address:
+                for balance in result['userBalances']:
+                    if int(balance['balance']) > 0:
+                        position = await self._create_position_from_balance(balance)
+                        positions.append(position)
+                return positions
+
+            # Get user ownership records
+            user_positions = await self.postgres_service.get_user_positions(user_address)
+            
+            # Filter and enrich positions with user data
             for balance in result['userBalances']:
                 if int(balance['balance']) > 0:
-                    print(f"Processing balance: {balance}")
-                    market_info = await MarketService.get_market(balance['asset']['id'])
-                    print(f"Market info: {market_info}")
-                    prices = self.get_orderbook_price(balance['asset']['id'])
-                    print(f"Current prices: {prices}")
+                    position = await self._create_position_from_balance(balance)
                     
-                    # Create balance array with proper positioning
-                    outcome_count = len(ast.literal_eval(market_info["outcomes"]))
-                    balances = [0.0] * outcome_count
-                    outcome_index = int(balance['asset']['outcomeIndex'])
-                    raw_balance = int(balance['balance'])
-                                        
-                    balances[outcome_index] = raw_balance
-                    
-                    position = Position(
-                        market_id=str(market_info["id"]),
-                        token_id=balance['asset']['id'],
-                        market_question=market_info["question"],
-                        outcomes=ast.literal_eval(market_info["outcomes"]),
-                        prices=[float(p) for p in ast.literal_eval(market_info["outcome_prices"])],
-                        balances=balances,
-                        # These will use the default None values
-                        entry_prices=None,
-                        timestamp=None
+                    # Find matching user position data
+                    user_pos = next(
+                        (p for p in user_positions 
+                         if p['condition_id'] == balance['asset']['condition']['id'] and
+                            p['outcome'] == int(balance['asset']['outcomeIndex'])),
+                        None
                     )
-                    print(f"Created position: {position}")
-                    positions.append(position)
-                        
-            print(f"Final positions: {positions}")
+                    
+                    if user_pos:
+                        position.entry_price = float(user_pos['entry_price'])
+                        positions.append(position)
+
             return positions
                 
         except Exception as e:
-            print(f"Error in get_positions: {str(e)}")
+            logger.error(f"Error in get_positions: {str(e)}")
             raise ValueError(f"Failed to fetch positions: {str(e)}")
 
     def calculate_price_impact(self, token_id: str, amount: float, price: float, side: str) -> dict:
@@ -453,3 +480,38 @@ class TraderService:
         except Exception as e:
             logger.error(f"Error calculating price impact: {str(e)}")
             raise ValueError(f"Failed to calculate price impact: {str(e)}")
+        
+    async def _create_position_from_balance(self, balance: Dict) -> Position:
+        """
+        Helper method to create Position object from balance data.
+        
+        Args:
+            balance: Dictionary containing asset and balance information from subgraph
+            
+        Returns:
+            Position: Constructed position object with market data
+        """
+        token_id = balance['asset']['id']
+        condition_id = balance['asset']['condition']['id']
+        
+        # Get market info asynchronously
+        market_info = await MarketService.get_market(token_id)
+        
+        # Get current prices
+        prices = self.get_orderbook_price(token_id)
+        
+        # Parse outcomes and create balance array
+        outcome_count = len(ast.literal_eval(market_info["outcomes"]))
+        balances = [0.0] * outcome_count
+        outcome_index = int(balance['asset']['outcomeIndex'])
+        balances[outcome_index] = float(balance['balance'])
+        
+        # Construct position object
+        return Position(
+            token_id=token_id,
+            market_id=condition_id,
+            market_question=market_info["question"],
+            outcomes=ast.literal_eval(market_info["outcomes"]),
+            prices=[float(p) for p in ast.literal_eval(market_info["outcome_prices"])],
+            balances=balances
+        )

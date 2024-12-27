@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from ...services.trader_service import TraderService
 from ...services.postgres_service import PostgresService
 from ...services.web3_service import Web3Service
+from ...services.position_sync_service import PositionSyncService
 from ...models.api import OrderRequest, OrderStatus
 from ...config import logger
 
@@ -10,6 +11,7 @@ router = APIRouter()
 trader_service = TraderService()
 postgres_service = PostgresService()
 web3_service = Web3Service()
+position_sync_service = PositionSyncService(postgres_service)
 
 @router.post("/api/delegated-order")
 async def submit_delegated_order(order: OrderRequest):
@@ -58,16 +60,35 @@ async def submit_delegated_order(order: OrderRequest):
     
 
 @router.get("/api/user-orders/{address}")
-async def get_user_orders(address: str):  # Make route async
+async def get_user_orders(address: str):
+    """
+    Get user orders and positions, ensuring markets are synced to the database.
+    
+    Args:
+        address: User's blockchain address
+        
+    Returns:
+        Dict containing pending orders and completed positions
+    """
     try:
-        # This stays synchronous
+        # Get pending orders (synchronous)
         pending_orders = postgres_service.get_user_pending_orders(address)
-        # This needs await since it's async
+        
+        # Get completed positions (async)
         completed_orders = await trader_service.get_positions()
-        return {"pending_orders": pending_orders, "completed_orders": completed_orders}
+        
+        # Sync markets from positions
+        await position_sync_service.sync_position_markets(completed_orders)
+        
+        return {
+            "pending_orders": pending_orders,
+            "completed_orders": completed_orders
+        }
+        
     except Exception as e:
         logger.error(f"Error getting user orders: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/api/order-status/{order_id}")
 async def get_order_status(order_id: str):
