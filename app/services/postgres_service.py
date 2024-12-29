@@ -529,32 +529,32 @@ class PostgresService:
             db.close()
 
     def get_user_positions(self, user_address: str) -> List[Dict[str, Any]]:
-        """
-        Retrieves all active positions for a user.
-        
-        Args:
-            user_address: User's blockchain address
-            
-        Returns:
-            List of position dictionaries containing position details
-        """
         db = self.get_db()
         try:
+            # Log the query parameters
+            logger.debug(f"Querying positions for user {user_address}")
+            
             positions = db.query(Position).filter(
                 Position.user_address == user_address,
-                Position.status == 'ACTIVE'
+                Position.status == 'active'
             ).all()
-
-            return [{
+            
+            # Log the raw query results
+            logger.debug(f"Found {len(positions)} positions in database")
+            
+            result = [{
                 'user_address': pos.user_address,
                 'condition_id': pos.condition_id,
-                'token_id': pos.token_id,
                 'outcome': pos.outcome,
                 'amount': pos.amount,
-                'entry_price': pos.entry_price,
+                'entry_price': pos.average_entry_price,
                 'status': pos.status
             } for pos in positions]
-
+            
+            # Log the transformed results
+            logger.debug(f"Transformed positions: {result}")
+            
+            return result
         except Exception as e:
             logger.error(f"Failed to get user positions: {str(e)}")
             raise

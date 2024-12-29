@@ -59,36 +59,51 @@ async def submit_delegated_order(order: OrderRequest):
         logger.error(f"Order submission failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
-
 @router.get("/api/user-orders/{address}")
 async def get_user_orders(address: str):
     """
-    Get user orders and positions, ensuring markets are synced to the database.
-    
-    Args:
-        address: User's blockchain address
-        
-    Returns:
-        Dict containing pending orders and completed positions
+    Get user orders and positions, using our existing postgres service.
     """
     try:
-        # Get pending orders (synchronous)
+        # Debug log for incoming request
+        logger.info(f"Receiving request for user positions: {address}")
+
+        # Get pending orders
         pending_orders = postgres_service.get_user_pending_orders(address)
-        
-        # Get completed positions (async)
-        completed_orders = await trader_service.get_positions()
-        
-        # Sync markets from positions
-        await position_sync_service.sync_position_markets(completed_orders)
-        
-        return {
+        logger.info(f"Pending orders count: {len(pending_orders) if pending_orders else 0}")
+
+        # Get positions
+        positions = postgres_service.get_user_positions(address)
+        logger.info(f"Raw positions from database: {positions}")
+
+        # Transform positions into frontend format
+        completed_orders = []
+        for position in positions:
+            position_dict = {
+                "market_id": position['condition_id'],
+                "balances": [float(position['amount']) * 1_000_000],
+                "prices": [float(position['entry_price'])],
+                "outcome": position['outcome'],
+                "status": position['status'].lower(),
+                "user_address": position['user_address']
+            }
+            completed_orders.append(position_dict)
+
+        # Log the final response
+        response_data = {
             "pending_orders": pending_orders,
             "completed_orders": completed_orders
         }
+        logger.info(f"Sending response: {response_data}")
         
+        return response_data
+
     except Exception as e:
-        logger.error(f"Error getting user orders: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error processing user orders: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing user orders: {str(e)}"
+        )
 
 
 @router.get("/api/order-status/{order_id}")
