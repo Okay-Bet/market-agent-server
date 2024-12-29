@@ -13,10 +13,12 @@ from ..models.api import Position
 from .sell_service import SellService
 from .web3_service import Web3Service
 from .market_service import MarketService
+from .postgres_service import PostgresService
 
 class TraderService:
     def __init__(self):
         self.web3_service = Web3Service()
+        self.postgres_service = PostgresService() 
         self.client = ClobClient(
             "https://clob.polymarket.com",
             key=PRIVATE_KEY,
@@ -191,17 +193,24 @@ class TraderService:
 
             # If trade successful, record position
             if result.get('success'):
-                self.postgres_service.record_position({
-                    'user_address': user_address,
-                    'order_id': result['order_id'],
-                    'token_id': token_id,
-                    'condition_id': condition_id,
-                    'outcome': int(outcome),
-                    'amount': amount,
-                    'price': price,
-                    'side': side
-                })
-
+                try:
+                    self.postgres_service.record_position({
+                        'user_address': user_address,
+                        'order_id': result['order_id'],
+                        'token_id': token_id,
+                        'condition_id': condition_id,
+                        'outcome': int(outcome),
+                        'amount': amount,
+                        'price': price,
+                        'side': side
+                    })
+                except Exception as db_error:
+                    logger.error(f"Failed to record position in database: {str(db_error)}")
+                    # Depending on your requirements, you might want to:
+                    # - Roll back the trade
+                    # - Mark it for retry
+                    # - Or just log and continue
+                    
             return result
 
         except Exception as e:

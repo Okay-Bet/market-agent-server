@@ -1,5 +1,6 @@
 from datetime import datetime
 import decimal
+import time
 import uuid
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine, text
@@ -434,83 +435,91 @@ class PostgresService:
 
     def record_position(self, position_data: Dict[str, Any]) -> None:
         """
-        Records a position ownership after a successful trade.
-        
-        Args:
-            position_data: Dictionary containing:
-                - user_address: Address of position owner
-                - order_id: ID of the executed order
-                - condition_id: Market condition ID
-                - outcome: Position outcome (0 or 1)
-                - amount: Position size
-                - price: Entry price
-                - side: Trade side (BUY/SELL)
+        Records a position ownership after a successful trade, ensuring all required
+        records exist in the database first.
         """
         db = self.get_db()
         try:
-            # Convert numeric values explicitly
-            amount = decimal.Decimal(str(position_data['amount']))
-            price = decimal.Decimal(str(position_data['price']))
-            current_time = datetime.utcnow()
-            
-            # Calculate cost basis
-            cost_basis = amount * price
-            
-            # First record/update the position
-            existing_position = db.query(Position).filter(
-                Position.user_address == position_data['user_address'],
-                Position.condition_id == position_data['condition_id'],
-                Position.outcome == position_data['outcome']
-            ).first()
+            with db.begin_nested():
+                # 1. First, ensure user exists
+                user_address = position_data['user_address']
+                user = db.query(User).filter(User.address == user_address).first()
+                
+                if not user:
+                    user = User(
+                        address=user_address,
+                        nonce=0,
+                        total_volume_usdc=decimal.Decimal('0'),
+                        total_realized_pnl=decimal.Decimal('0'),
+                        total_trades=0,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow()
+                    )
+                    db.add(user)
+                    db.flush()  # Ensure user is created before continuing
+                    logger.info(f"Created new user record for address: {user_address}")
 
-            if existing_position:
-                # Update existing position with proper decimal handling
-                total_amount = existing_position.amount + amount
-                existing_position.entry_price = (
-                    (existing_position.amount * existing_position.entry_price + 
-                    amount * price) / total_amount
-                )
-                existing_position.amount = total_amount
-                existing_position.total_cost_basis += cost_basis
-                existing_position.updated_at = current_time
-                logger.info(f"Updated position for user {position_data['user_address']}, new amount: {total_amount}")
-            else:
-                # Create new position with all required fields
-                new_position = Position(
-                    id=uuid.uuid4(),  # Generate UUID for position
-                    user_address=position_data['user_address'],
-                    condition_id=position_data['condition_id'],
-                    outcome=position_data['outcome'],
-                    amount=amount,
-                    entry_price=price,
-                    collateral_token=USDC_ADDRESS,  #
-                    total_cost_basis=cost_basis,
-                    unrealized_pnl=decimal.Decimal('0'),
-                    realized_pnl=decimal.Decimal('0'),
-                    status='active',  # Use lowercase to match schema convention
-                    created_at=current_time,
-                    updated_at=current_time
-                )
-                db.add(new_position)
-                logger.info(f"Created new position for user {position_data['user_address']}")
+                # 2. Ensure market exists
+                condition_id = position_data['condition_id']
+                market = db.query(Market).filter(Market.condition_id == condition_id).first()
+                
+                if not market:
+                    # Create basic market record if it doesn't exist
+                    market = Market(
+                        condition_id=condition_id,
+                        status='active',
+                        total_volume_usdc=decimal.Decimal('0'),
+                        created_at=datetime.utcnow()
+                    )
+                    db.add(market)
+                    db.flush()  # Ensure market is created before continuing
+                    logger.info(f"Created new market record for condition: {condition_id}")
 
-            # Record the order with all required fields
-            order = Order(
-                id=position_data['order_id'],
-                user_address=position_data['user_address'],
-                market_id=position_data['condition_id'],
-                price=price,
-                amount=amount,
-                side=position_data['side'],
-                status='executed',  # Use lowercase to match schema convention
-                created_at=current_time,
-                updated_at=current_time,
-                executed_at=current_time  # Since this is an executed order
-            )
-            db.add(order)
+                # 3. Now create the position
+                amount = decimal.Decimal(str(position_data['amount']))
+                price = decimal.Decimal(str(position_data['price']))
+                current_time = datetime.utcnow()
+                cost_basis = amount * price
 
-            db.commit()
-            logger.info(f"Successfully recorded position and order for user {position_data['user_address']}")
+                existing_position = db.query(Position).filter(
+                    Position.user_address == user_address,
+                    Position.condition_id == condition_id,
+                    Position.outcome == position_data['outcome']
+                ).first()
+
+                if existing_position:
+                    # Update existing position logic
+                    total_amount = existing_position.amount + amount
+                    existing_position.average_entry_price = (
+                        (existing_position.amount * existing_position.average_entry_price +
+                        amount * price) / total_amount
+                    )
+                    existing_position.amount = total_amount
+                    existing_position.total_cost_basis += cost_basis
+                    existing_position.updated_at = current_time
+                else:
+                    # Create new position
+                    new_position = Position(
+                        id=uuid.uuid4(),
+                        user_address=user_address,
+                        condition_id=condition_id,
+                        outcome=position_data['outcome'],
+                        amount=amount,
+                        average_entry_price=price,
+                        collateral_token=USDC_ADDRESS,
+                        total_cost_basis=cost_basis,
+                        unrealized_pnl=decimal.Decimal('0'),
+                        realized_pnl=decimal.Decimal('0'),
+                        status='active',
+                        created_at=current_time,
+                        updated_at=current_time,
+                        order_id=position_data['order_id']
+                    )
+                    db.add(new_position)
+
+                # 4. Commit everything in one transaction
+                db.commit()
+                logger.info(f"Successfully recorded all records for user {user_address}")
 
         except Exception as e:
             db.rollback()
