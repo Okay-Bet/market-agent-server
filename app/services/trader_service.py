@@ -382,23 +382,37 @@ class TraderService:
             levels_used = 0
 
             if side == "BUY":
-                # For buys, analyze the ask side
                 asks = [(float(a.price), float(a.size)) for a in orderbook.asks] if orderbook.asks else []
                 if not asks:
-                    raise ValueError("No ask liquidity available")
-                    
-                asks.sort(key=lambda x: x[0])  # Sort by price ascending
+                    return {
+                        "valid": False,
+                        "min_order_size": int(min_usdc_amount * 1_000_000),
+                        "max_order_size": 1_000_000_000_000,
+                        "error": "No ask liquidity available",
+                        "estimated_total": int(amount * 1_000_000)  # Always include estimated_total
+                    }
                 
-                # Verify there's liquidity at or below our price
-                if not any(ask_price <= price for ask_price, _ in asks):
-                    raise ValueError(f"No liquidity available at or below price {price}")
+                asks.sort(key=lambda x: x[0])
+                available_at_price = [ask for ask in asks if ask[0] <= price]
                 
-                # Calculate available liquidity at our price or better
-                executable_liquidity = sum(size for p, size in asks if p <= price)
-                total_available_liquidity = sum(size for _, size in asks)
-
+                if not available_at_price:
+                    return {
+                        "valid": False,
+                        "min_order_size": int(min_usdc_amount * 1_000_000),
+                        "max_order_size": 1_000_000_000_000,
+                        "error": f"No liquidity available at or below price {price}",
+                        "estimated_total": int(amount * 1_000_000)
+                    }
+                
+                executable_liquidity = sum(size for p, size in available_at_price)
                 if executable_liquidity < token_amount:
-                    raise ValueError(f"Insufficient liquidity: need {token_amount:.2f} tokens, only {executable_liquidity:.2f} available at or below price {price}")
+                    return {
+                        "valid": False,
+                        "min_order_size": int(min_usdc_amount * 1_000_000),
+                        "max_order_size": 1_000_000_000_000,
+                        "error": f"Insufficient liquidity: need {token_amount:.2f} tokens, only {executable_liquidity:.2f} available",
+                        "estimated_total": int(amount * 1_000_000)
+                    }
 
                 # Calculate actual execution price including impact
                 remaining_tokens = token_amount
@@ -443,7 +457,13 @@ class TraderService:
             }
         except Exception as e:
             logger.error(f"Error calculating price impact: {str(e)}")
-            raise ValueError(f"Failed to calculate price impact: {str(e)}")
+            return {
+                "valid": False,
+                "min_order_size": int(min_usdc_amount * 1_000_000) if 'min_usdc_amount' in locals() else 1_000_000,
+                "max_order_size": 1_000_000_000_000,
+                "error": str(e),
+                "estimated_total": int(amount * 1_000_000) if 'amount' in locals() else 0
+            }
         
     async def _create_position_from_balance(self, balance: Dict) -> Position:
         """
