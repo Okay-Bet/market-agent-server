@@ -1,19 +1,21 @@
 # app/services/market_resolution.py
-from typing import Dict
+from typing import Any, List, Tuple, Optional, Dict
 import functools
 import time
-from web3 import Web3
+from web3 import Web3, exceptions
+from eth_utils import to_bytes
 from eth_typing import HexAddress
+from sqlalchemy.exc import SQLAlchemyError
 from ..config import logger
+from ..services.market_service import MarketService
 
 def log_execution_time(func):
+    """Decorator to measure and log execution time of market processing functions"""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()
-        logger.info(f"Starting {func.__name__}")
         try:
             result = func(*args, **kwargs)
-            logger.info(f"Completed {func.__name__} in {time.time() - start_time:.2f} seconds")
             return result
         except Exception as e:
             logger.error(f"Error in {func.__name__}: {str(e)}", exc_info=True)
@@ -21,47 +23,157 @@ def log_execution_time(func):
     return wrapper
 
 class MarketResolutionService:
+    """
+    Service to handle Polymarket resolution, including on-chain verification
+    and position redemption for resolved markets.
+    """
     def __init__(self, web3_service, postgres_service):
         self.w3 = web3_service.w3
         self.web3_service = web3_service
         self.ctf_contract = web3_service.ctf
         self.db = postgres_service
+        self.market_service = MarketService()
 
-    def check_market_resolution(self, condition_id: str) -> bool:
-        """Check if a market has been resolved by checking payoutDenominator"""
+    def _convert_condition_id_to_bytes32(self, condition_id: str) -> bytes:
+        """
+        Convert string condition ID to bytes32 format required by smart contract
+        Args:
+            condition_id: Market condition ID (hex or decimal string)
+        Returns:
+            bytes: 32-byte representation for contract interaction
+        """
         try:
-            payout_denominator = self.ctf_contract.functions.payoutDenominator(condition_id).call()
-            return payout_denominator > 0
+            if condition_id.startswith('0x'):
+                return to_bytes(hexstr=condition_id)
+            
+            condition_int = int(condition_id)
+            padded_hex = '0x' + hex(condition_int)[2:].zfill(64)
+            return to_bytes(hexstr=padded_hex)
         except Exception as e:
-            logger.error(f"Failed to check market resolution for {condition_id}: {str(e)}")
-            return False
-
-    def get_winning_outcome(self, condition_id: str) -> int:
-        """Get winning outcome (0 for NO, 1 for YES)"""
-        try:
-            payout_numerators = self.ctf_contract.functions.payoutNumerators(condition_id).call()
-            return 1 if payout_numerators[1] > 0 else 0
-        except Exception as e:
-            logger.error(f"Failed to get winning outcome for {condition_id}: {str(e)}")
+            logger.error(f"Failed to convert condition ID {condition_id}: {str(e)}")
             raise
 
-    def redeem_and_transfer(
+    async def _check_gamma_resolution(self, token_id: str) -> Optional[Tuple[bool, int]]:
+        """
+        Check market resolution via Gamma API
+        Args:
+            token_id: Market token ID
+        Returns:
+            Optional[Tuple[bool, int]]: (is_resolved, winning_outcome) or None if unresolved
+        """
+        try:
+            market_data = await self.market_service.get_market(token_id)
+            if not market_data:
+                return None
+                
+            prices_str = market_data['outcome_prices'].strip('[]').split(',')
+            prices = [float(p.strip()) for p in prices_str]
+            
+            if len(prices) != 2:
+                logger.warning(f"Unexpected price format for token {token_id}: {prices}")
+                return None
+                
+            # Map prices to outcomes: [1.0, 0.0] = YES won, [0.0, 1.0] = NO won
+            if prices[0] == 1.0 and prices[1] == 0.0:
+                return True, 1  # YES won
+            elif prices[0] == 0.0 and prices[1] == 1.0:
+                return True, 0  # NO won
+            
+            return False, None
+            
+        except ValueError as e:
+            logger.info(f"Market data not available for token {token_id}")
+            return None
+        except Exception as e:
+            logger.error(f"Error checking Gamma resolution for token {token_id}: {str(e)}")
+            return None
+
+    async def check_market_resolution(self, condition_id: str, token_id: str = None) -> Tuple[bool, Optional[int]]:
+        """
+        Enhanced market resolution check with multiple fallback mechanisms
+        
+        Args:
+            condition_id: Market condition ID
+            token_id: Token ID for Gamma lookup
+        Returns:
+            Tuple[bool, Optional[int]]: (is_resolved, winning_outcome)
+        """
+        try:
+            # 1. First try on-chain verification
+            try:
+                condition_bytes = self._convert_condition_id_to_bytes32(condition_id)
+                denominator = self.ctf_contract.functions.payoutDenominator(condition_bytes).call()
+                
+                if denominator > 0:
+                    payout_numerators = self.ctf_contract.functions.payoutNumerators(condition_bytes).call()
+                    winning_outcome = 1 if payout_numerators[1] > 0 else 0
+                    return True, winning_outcome
+            except exceptions.ContractLogicError as e:
+                logger.info(f"Contract check failed for {condition_id}, trying Gamma: {str(e)}")
+
+            # 2. Try Gamma API if we have token_id
+            if token_id:
+                try:
+                    gamma_result = await self._check_gamma_resolution(token_id)
+                    if gamma_result:
+                        is_resolved, outcome = gamma_result
+                        if is_resolved:
+                            logger.info(f"Market {condition_id} resolved via Gamma with outcome: {outcome}")
+                            return True, outcome
+                except Exception as e:
+                    logger.info(f"Gamma check failed for {token_id}, trying metadata: {str(e)}")
+
+            # 3. Final fallback - check market metadata in database
+            try:
+                market = self.db.get_market(condition_id)
+                if market and market.get('market_metadata'):
+                    metadata = market['market_metadata']
+                    outcome_prices = metadata.get('outcome_prices')
+                    
+                    if isinstance(outcome_prices, str):
+                        import ast
+                        outcome_prices = ast.literal_eval(outcome_prices)
+                    
+                    if outcome_prices == [1.0, 0.0]:
+                        return True, 1
+                    elif outcome_prices == [0.0, 1.0]:
+                        return True, 0
+            except Exception as e:
+                logger.error(f"Metadata check failed for {condition_id}: {str(e)}")
+
+            return False, None
+
+        except Exception as e:
+            logger.error(f"Error checking resolution status for {condition_id}: {str(e)}")
+            return False, None
+
+    def redeem_positions(
         self,
-        user_address: HexAddress,
+        user_address: str,
         condition_id: str,
-        collateral_token: HexAddress,
+        collateral_token: str,
         winning_outcome: int,
         amount: int
     ) -> Dict:
-        """Redeem winning position tokens and transfer proceeds to user"""
+        """
+        Redeem winning positions and transfer proceeds
+        Args:
+            user_address: Winner's address
+            condition_id: Market condition ID
+            collateral_token: USDC contract address
+            winning_outcome: 0 for NO, 1 for YES
+            amount: Position amount to redeem
+        Returns:
+            Dict with transaction details
+        """
         try:
-            # First redeem the position
+            condition_bytes = self._convert_condition_id_to_bytes32(condition_id)
             index_sets = [1] if winning_outcome == 0 else [2]
             
             tx = self.ctf_contract.functions.redeemPositions(
-                collateral_token,
-                "0x" + "0" * 64,  # parentCollectionId is always 0 for Polymarket
-                condition_id,
+                Web3.to_checksum_address(collateral_token),
+                '0x' + '0' * 64,  # parentCollectionId is always 0 for Polymarket
+                condition_bytes,
                 index_sets
             ).build_transaction({
                 'from': self.w3.eth.default_account,
@@ -76,7 +188,7 @@ class MarketResolutionService:
             if receipt.status != 1:
                 raise Exception("Redemption transaction failed")
 
-            # After successful redemption, transfer USDC to user
+            # Transfer USDC after successful redemption
             transfer_result = self.web3_service.transfer_usdc(
                 Web3.to_checksum_address(user_address),
                 amount
@@ -94,101 +206,138 @@ class MarketResolutionService:
             logger.error(f"Failed to redeem and transfer for {condition_id}, user {user_address}: {str(e)}")
             raise
 
+    def get_pending_redemptions(self) -> List[Dict[str, Any]]:
+        """
+        Fetch resolved markets that still need position processing.
+        Returns markets that are resolved but not marked as processed.
+        """
+        query = """
+            SELECT 
+                condition_id,
+                token_id,
+                status,
+                winning_outcome,
+                market_metadata,
+                created_at,
+                resolved_at
+            FROM markets 
+            WHERE status = 'resolved'
+            AND (processed_at IS NULL OR winning_outcome IS NOT NULL)
+            ORDER BY resolved_at ASC
+        """
+        
+        try:
+            return self.execute_query(query)
+        except SQLAlchemyError as e:
+            logger.error("Failed to fetch pending redemptions", exc_info=True)
+            raise
+
     @log_execution_time
-    def process_unresolved_markets(self):
-        """Process all unresolved markets"""
+    async def process_unresolved_markets(self) -> None:
+        """
+        Enhanced market processing that handles both resolution and redemption.
+        """
         try:
             logger.info("=" * 50)
             logger.info("Starting market resolution process")
             logger.info("=" * 50)
             
-            # Get all unresolved markets from database
+            # First, handle unresolved markets
             unresolved_markets = self.db.get_unresolved_markets()
-            logger.info(f"Found {len(unresolved_markets) if unresolved_markets else 0} unresolved markets")
+            if unresolved_markets:
+                for market in unresolved_markets:
+                    await self._process_market_resolution(market)
             
-            if not unresolved_markets:
-                logger.info("No unresolved markets to process")
+            # Then, handle pending redemptions
+            pending_redemptions = self.db.get_pending_redemptions()
+            if pending_redemptions:
+                for market in pending_redemptions:
+                    await self._process_market_redemptions(market)
+                    
+        except Exception as e:
+            logger.error(f"Error in process_unresolved_markets: {str(e)}")
+            raise
+
+    async def _process_market_redemptions(self, market: Dict[str, Any]) -> None:
+        """
+        Process all winning positions for a resolved market.
+        
+        Args:
+            market: Dictionary containing resolved market data
+        """
+        try:
+            condition_id = market['condition_id']
+            winning_outcome = market.get('winning_outcome')
+            
+            if winning_outcome is None:
+                logger.error(f"Market {condition_id} has no winning outcome set")
                 return
                 
-            for market in unresolved_markets:
-                condition_id = market['condition_id']
-                logger.info("-" * 30)
-                logger.info(f"Processing market {condition_id}")
+            
+            # Get all winning positions
+            positions = self.db.get_market_positions(condition_id)
+            winning_positions = [p for p in positions if int(p['outcome']) == winning_outcome]
+            
+            if not winning_positions:
+                self._mark_market_processed(condition_id)
+                return
                 
+            
+            for position in winning_positions:
                 try:
-                    # Check if market is resolved
-                    is_resolved = self.check_market_resolution(condition_id)
-                    logger.info(f"Market {condition_id} resolution status: {is_resolved}")
+                    user_address = position['user_address']
+                    amount = position.get('amount', 0)
                     
-                    if not is_resolved:
-                        logger.info(f"Market {condition_id} not yet resolved, skipping")
+                    if not amount:
+                        logger.warning(f"No amount found for position: {position}")
                         continue
 
-                    # Get winning outcome
-                    winning_outcome = self.get_winning_outcome(condition_id)
-                    logger.info(f"Market {condition_id} resolved with outcome: {'YES' if winning_outcome == 1 else 'NO'}")
+                    # Execute redemption and transfer
+                    result = self.redeem_positions(
+                        user_address=user_address,
+                        condition_id=condition_id,
+                        collateral_token=position['collateral_token'],
+                        winning_outcome=winning_outcome,
+                        amount=int(float(amount))
+                    )
                     
-                    # Get all positions for this market
-                    positions = self.db.get_market_positions(condition_id)
-                    logger.info(f"Found {len(positions)} positions for market {condition_id}")
+                    logger.info(f"Redemption successful for user {user_address}: {result}")
                     
-                    winning_positions = [p for p in positions if int(p['outcome']) == winning_outcome]
-                    logger.info(f"Found {len(winning_positions)} winning positions to process")
-                    
-                    # Process winning positions
-                    for position in winning_positions:
-                        user_address = position['user_address']
-                        logger.info(f"Processing winning position for user {user_address}")
-                        
-                        try:
-                            amount = position.get('amount', 0)
-                            if not amount:
-                                logger.warning(f"No amount found for position: {position}")
-                                continue
-
-                            # Redeem position and transfer USDC
-                            result = self.redeem_and_transfer(
-                                user_address=user_address,
-                                condition_id=condition_id,
-                                collateral_token=position['collateral_token'],
-                                winning_outcome=winning_outcome,
-                                amount=int(float(amount))
-                            )
-                            
-                            logger.info(f"Redemption successful for user {user_address}: {result}")
-                            
-                            # Update position status in database
-                            self.db.mark_position_redeemed(
-                                condition_id,
-                                user_address,
-                                {
-                                    'redemption_tx': result['redemption_tx'],
-                                    'transfer_tx': result['transfer_tx'],
-                                    'amount_transferred': result['amount_transferred']
-                                }
-                            )
-                            logger.info(f"Position marked as redeemed in database for user {user_address}")
-
-                        except Exception as e:
-                            logger.error(f"Failed to process position for user {user_address}: {str(e)}", exc_info=True)
-                            continue
-                    
-                    # Mark market as resolved in database
-                    current_block = self.w3.eth.get_block('latest')
-                    self.db.mark_market_resolved(
+                    # Update position status
+                    self.db.mark_position_redeemed(
                         condition_id,
-                        winning_outcome,
+                        user_address,
                         {
-                            "timestamp": current_block.timestamp,
-                            "processed_at": current_block.timestamp
+                            'redemption_tx': result['redemption_tx'],
+                            'transfer_tx': result['transfer_tx'],
+                            'amount_transferred': result['amount_transferred']
                         }
                     )
                     
-                    logger.info(f"Successfully completed processing for market {condition_id}")
-                    
                 except Exception as e:
-                    logger.error(f"Failed to process market {condition_id}: {str(e)}", exc_info=True)
+                    logger.error(f"Failed to process position for user {user_address}: {str(e)}")
                     continue
-
+            
+            # Mark market as fully processed
+            self._mark_market_processed(condition_id)
+            logger.info(f"Successfully processed all redemptions for market {condition_id}")
+            
         except Exception as e:
-            logger.error(f"Error in process_unresolved_markets: {str(e)}", exc_info=True)
+            logger.error(f"Failed to process redemptions for market {condition_id}: {str(e)}")
+            raise
+
+    def _mark_market_processed(self, condition_id: str) -> None:
+        """
+        Mark a market as fully processed after handling all redemptions.
+        """
+        query = """
+            UPDATE markets 
+            SET processed_at = CURRENT_TIMESTAMP
+            WHERE condition_id = :condition_id
+        """
+        
+        try:
+            self.db.execute_query(query, {"condition_id": condition_id})
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to mark market {condition_id} as processed: {str(e)}")
+            raise

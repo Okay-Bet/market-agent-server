@@ -20,14 +20,13 @@ async def submit_delegated_order(order: OrderRequest):
         
         # Convert the incoming raw amount to decimal USDC
         decimal_amount = float(order.amount) / 1_000_000
-        
         logger.info(f"""
         Order Processing:
         Raw USDC amount: {order.amount}
         Decimal USDC amount: {decimal_amount}
         Price: {order.price}
         """)
-
+        
         # Execute trade with the exact amount received
         try:
             logger.info(f"Executing trade for user: {order.user_address}")
@@ -36,7 +35,8 @@ async def submit_delegated_order(order: OrderRequest):
                 price=order.price,
                 amount=decimal_amount,
                 side=order.side,
-                is_yes_token=order.is_yes_token
+                is_yes_token=order.is_yes_token,
+                user_address=order.user_address
             )
             
             if not result or not result.get('success'):
@@ -48,6 +48,7 @@ async def submit_delegated_order(order: OrderRequest):
                 "status": "completed",
                 "transaction": result
             })
+            
         except Exception as e:
             logger.error(f"Trade execution failed: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -119,36 +120,61 @@ async def validate_order(order: OrderRequest):
     try:
         logger.info(f"Validating order request: {order.dict()}")
         
-        # Calculate price impact
+        # Calculate minimum order size based on price
+        # Need 5 tokens minimum, so calculate USDC equivalent
+        min_token_amount = 5  # Always need 5 tokens minimum
+        min_usdc_amount = min_token_amount * order.price
+        min_order_size = int(min_usdc_amount * 1_000_000)  # Convert to base units
+        max_order_size = 1_000_000_000_000  # $1M in base units
+        
+        # Log minimum size calculation
+        logger.info(f"""
+        Minimum Size Calculation:
+        - Price: {order.price}
+        - Min Tokens: {min_token_amount}
+        - Min USDC: {min_usdc_amount}
+        - Min Order Size (base units): {min_order_size}
+        - Requested Amount: {order.amount}
+        """)
+
+        # Validate minimum order size
+        if int(order.amount) < min_order_size:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "valid": False,
+                    "min_order_size": min_order_size,  # Dynamic based on price
+                    "max_order_size": max_order_size,
+                    "error": f"Order size ${float(order.amount)/1_000_000:.4f} below minimum ${min_usdc_amount:.4f} (5 tokens at price {order.price})"
+                }
+            )
+
         impact_analysis = trader_service.calculate_price_impact(
             order.token_id,
-            float(order.amount) / 1_000_000,  # Convert to decimal
+            float(order.amount) / 1_000_000,
             order.price,
             order.side
         )
-        
-        # Log orderbook state and validation results
-        logger.info(f"""
-            Order Validation:
-            - Side: {order.side}
-            - Price: {order.price}
-            - USDC Amount: {float(order.amount) / 1_000_000}
-            - Best Bid: {trader_service.get_orderbook_price(order.token_id)[0]}
-            - Best Ask: {trader_service.get_orderbook_price(order.token_id)[1]}
-            """)
 
-        # Return format that maintains backward compatibility
         return {
             "valid": True,
-            "min_order_size": 1000000,  # 1 USDC in base units
-            "max_order_size": 1000000000000,  # 1M USDC in base units
-            "estimated_total": int(impact_analysis['estimated_total'] * 1_000_000),  # Convert back to base units
+            "min_order_size": min_order_size,  
+            "max_order_size": max_order_size,
+            "estimated_total": int(impact_analysis['estimated_total']),
             "price_impact": impact_analysis['price_impact'],
             "execution_possible": impact_analysis['execution_possible'],
-            "warning": None if impact_analysis['price_impact'] < 0.05 else 
+            "warning": None if impact_analysis['price_impact'] < 0.05 else
                       f"High price impact: {impact_analysis['price_impact']*100:.1f}%"
         }
 
     except Exception as e:
         logger.error(f"Order validation failed: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(
+            status_code=400,
+            content={
+                "valid": False,
+                "min_order_size": min_order_size,
+                "max_order_size": max_order_size,
+                "error": str(e)
+            }
+        )

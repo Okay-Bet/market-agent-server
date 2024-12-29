@@ -42,27 +42,19 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     try:
-        logger.info("Creating database tables...")
         Base.metadata.create_all(bind=engine)
 
-        logger.info("Applying schema updates...")
         with engine.connect() as conn:
-            # First, drop existing foreign key constraints
-            logger.info("Dropping existing foreign key constraints...")
             conn.execute(text("""
                 ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_condition_id_fkey;
                 ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_condition_id_fkey;
             """))
 
-            # Modify the markets table structure
-            logger.info("Updating markets table schema...")
             conn.execute(text("""
                 ALTER TABLE markets ALTER COLUMN condition_id TYPE varchar(256);
                 ALTER TABLE markets ADD COLUMN IF NOT EXISTS token_id varchar(256);
             """))
 
-            # Recreate foreign key constraints
-            logger.info("Recreating foreign key constraints...")
             conn.execute(text("""
                 ALTER TABLE positions 
                     ADD CONSTRAINT positions_condition_id_fkey 
@@ -73,15 +65,11 @@ async def startup_event():
                     FOREIGN KEY (condition_id) REFERENCES markets(condition_id);
             """))
 
-            # Create new indexes
-            logger.info("Creating new indexes...")
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS ix_markets_token_id ON markets(token_id);
                 CREATE INDEX IF NOT EXISTS ix_positions_order ON positions(order_id);
             """))
 
-            # Add your existing position changes
-            logger.info("Adding position table updates...")
             conn.execute(text("""
                 ALTER TABLE positions
                 ADD COLUMN IF NOT EXISTS order_id varchar(66);
@@ -89,7 +77,6 @@ async def startup_event():
 
             # Commit all changes
             conn.commit()
-            logger.info("Database schema updates completed successfully")
 
     except Exception as e:
         logger.error(f"Failed to start services: {str(e)}")

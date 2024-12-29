@@ -150,8 +150,8 @@ class TraderService:
         try:
             # First get market info from the subgraph to map token_id to condition_id
             query = gql("""
-                query GetMarketInfo($tokenId: String!) {
-                    asset(id: $tokenId) {
+                query GetMarketInfo($tokenId: ID!) {
+                    tokenIdCondition(id: $tokenId) {
                         condition {
                             id
                         }
@@ -165,8 +165,8 @@ class TraderService:
             })
             
             # Extract condition_id and outcome from the result
-            condition_id = result['asset']['condition']['id']
-            outcome = result['asset']['outcomeIndex']
+            condition_id = result['tokenIdCondition']['condition']['id']
+            outcome = result['tokenIdCondition']['outcomeIndex']
             
             # Your existing orderbook verification
             orderbook = self.client.get_order_book(token_id)
@@ -342,20 +342,6 @@ class TraderService:
             amount (float): USDC amount in decimal format (e.g., 1.0 = 1 USDC)
             price (float): Target price per token
             side (str): "BUY" or "SELL"
-            
-        Returns:
-            dict: Detailed impact analysis containing:
-                - token_amount: Number of tokens to trade
-                - available_liquidity: Total available liquidity at any price
-                - executable_liquidity: Available liquidity at acceptable prices
-                - weighted_avg_price: Expected average execution price
-                - price_impact: Calculated price impact as a decimal
-                - execution_possible: Whether full execution is possible
-                - estimated_total: Estimated total USDC needed including impact
-                - levels_used: Number of orderbook levels needed
-                
-        Raises:
-            ValueError: If orderbook can't be fetched or invalid parameters
         """
         try:
             # Input validation
@@ -371,112 +357,81 @@ class TraderService:
             if not orderbook:
                 raise ValueError("Unable to fetch orderbook")
 
+            # Calculate minimum order size (whichever is higher: $1 or 5 tokens worth)
+            min_token_amount = 5  # Minimum 5 tokens
+            min_usdc_by_tokens = min_token_amount * price
+            min_usdc_amount = max(1.0, min_usdc_by_tokens)  # Take larger of $1 or 5 tokens worth
+            
+            if amount < min_usdc_amount:
+                raise ValueError(f"Order size ${amount:.4f} below minimum ${min_usdc_amount:.4f} (5 tokens or $1, whichever is higher)")
+
             # Initialize analysis variables
             token_amount = amount / price  # How many tokens we want
             total_available_liquidity = 0
             executable_liquidity = 0
             total_cost = 0
             levels_used = 0
-            
-            logger.info(f"""
-            Starting Price Impact Calculation:
-            - Token ID: {token_id}
-            - USDC Amount: {amount}
-            - Target Price: {price}
-            - Side: {side}
-            - Tokens Needed: {token_amount}
-            """)
 
             if side == "BUY":
-                # For buys, we analyze the ask side of the book
-                # Convert all asks to float and sort by price
-                asks = [(float(a.price), float(a.size)) for a in orderbook.asks]
+                # For buys, analyze the ask side
+                asks = [(float(a.price), float(a.size)) for a in orderbook.asks] if orderbook.asks else []
+                if not asks:
+                    raise ValueError("No ask liquidity available")
+                    
                 asks.sort(key=lambda x: x[0])  # Sort by price ascending
                 
-                remaining_tokens = token_amount
-                max_acceptable_price = price * 1.50  # Allow up to 50% price impact
+                # Verify there's liquidity at or below our price
+                if not any(ask_price <= price for ask_price, _ in asks):
+                    raise ValueError(f"No liquidity available at or below price {price}")
                 
+                # Calculate available liquidity at our price or better
+                executable_liquidity = sum(size for p, size in asks if p <= price)
+                total_available_liquidity = sum(size for _, size in asks)
+
+                if executable_liquidity < token_amount:
+                    raise ValueError(f"Insufficient liquidity: need {token_amount:.2f} tokens, only {executable_liquidity:.2f} available at or below price {price}")
+
+                # Calculate actual execution price including impact
+                remaining_tokens = token_amount
                 for level_price, level_size in asks:
-                    total_available_liquidity += level_size
-                    
-                    # Skip levels with prices too high
-                    if level_price > max_acceptable_price:
-                        continue
+                    if level_price > price:
+                        break
                         
-                    executable_liquidity += level_size
-                    
-                    if remaining_tokens > 0:
-                        # Calculate how many tokens we can take from this level
-                        tokens_from_level = min(remaining_tokens, level_size)
-                        total_cost += tokens_from_level * level_price
-                        remaining_tokens -= tokens_from_level
-                        levels_used += 1
-                        
-                        logger.debug(f"""
-                        Processing Level:
-                        - Price: {level_price}
-                        - Size: {level_size}
-                        - Used: {tokens_from_level}
-                        - Remaining Needed: {remaining_tokens}
-                        """)
+                    tokens_from_level = min(remaining_tokens, level_size)
+                    total_cost += tokens_from_level * level_price
+                    remaining_tokens -= tokens_from_level
+                    levels_used += 1
+                    if remaining_tokens <= 0:
+                        break
 
-            else:  # SELL side
-                # For sells, we analyze the bid side of the book
-                bids = [(float(b.price), float(b.size)) for b in orderbook.bids]
-                bids.sort(key=lambda x: x[0], reverse=True)  # Sort by price descending
-                
-                remaining_tokens = token_amount
-                min_acceptable_price = price * 0.50  # Allow up to 50% price impact
-                
-                for level_price, level_size in bids:
-                    total_available_liquidity += level_size
-                    
-                    # Skip levels with prices too low
-                    if level_price < min_acceptable_price:
-                        continue
-                        
-                    executable_liquidity += level_size
-                    
-                    if remaining_tokens > 0:
-                        tokens_from_level = min(remaining_tokens, level_size)
-                        total_cost += tokens_from_level * level_price
-                        remaining_tokens -= tokens_from_level
-                        levels_used += 1
-
-            # Calculate weighted average price and impact
-            tokens_executed = token_amount - remaining_tokens
-            if tokens_executed > 0:
-                weighted_avg_price = total_cost / tokens_executed
-                price_impact = abs(weighted_avg_price - price) / price
-            else:
-                weighted_avg_price = price
-                price_impact = 0
+            # Calculate final metrics
+            weighted_avg_price = total_cost / token_amount if token_amount > 0 else price
+            price_impact = (weighted_avg_price - price) / price if price > 0 else 0
 
             result = {
+                "valid": True,
+                "min_order_size": int(min_usdc_amount * 1_000_000),  # Convert to base units
+                "max_order_size": 1_000_000_000_000,  # $1M in base units
                 "token_amount": token_amount,
                 "available_liquidity": total_available_liquidity,
                 "executable_liquidity": executable_liquidity,
                 "weighted_avg_price": weighted_avg_price,
                 "price_impact": price_impact,
                 "execution_possible": executable_liquidity >= token_amount,
-                "estimated_total": total_cost if tokens_executed == token_amount else amount * (1 + price_impact),
-                "levels_used": levels_used,
-                "remaining_tokens": remaining_tokens
+                "estimated_total": int(total_cost * 1_000_000),  # Convert to base units
+                "levels_used": levels_used
             }
-            
-            logger.info(f"""
-            Price Impact Analysis Result:
-            - Available Liquidity: {result['available_liquidity']:.6f}
-            - Executable Liquidity: {result['executable_liquidity']:.6f}
-            - Weighted Avg Price: {result['weighted_avg_price']:.6f}
-            - Price Impact: {result['price_impact']*100:.2f}%
-            - Execution Possible: {result['execution_possible']}
-            - Estimated Total USDC: {result['estimated_total']:.6f}
-            - Orderbook Levels Used: {result['levels_used']}
-            """)
-            
+
             return result
 
+        except ValueError as e:
+            # Convert validation errors to a consistent response format
+            return {
+                "valid": False,
+                "min_order_size": int(min_usdc_amount * 1_000_000) if 'min_usdc_amount' in locals() else 1_000_000,
+                "max_order_size": 1_000_000_000_000,
+                "error": str(e)
+            }
         except Exception as e:
             logger.error(f"Error calculating price impact: {str(e)}")
             raise ValueError(f"Failed to calculate price impact: {str(e)}")

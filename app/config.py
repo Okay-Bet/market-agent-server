@@ -30,32 +30,43 @@ USDC_ABI = [
 
 CTF_ABI = [
     {
-        "inputs": [
-            {"name": "account", "type": "address"},
-            {"name": "id", "type": "uint256"}
-        ],
-        "name": "balanceOf",
+        "constant": True,
+        "inputs": [{"name": "", "type": "bytes32"}],
+        "name": "payoutDenominator",
         "outputs": [{"name": "", "type": "uint256"}],
+        "payable": False,
         "stateMutability": "view",
         "type": "function"
     },
     {
-        "inputs": [
-            {"name": "owner", "type": "address"},
-            {"name": "operator", "type": "address"}
-        ],
-        "name": "isApprovedForAll",
-        "outputs": [{"name": "", "type": "bool"}],
+        "constant": True,
+        "inputs": [{"name": "", "type": "bytes32"}],
+        "name": "payoutNumerators",
+        "outputs": [{"name": "", "type": "uint256[]"}],
+        "payable": False,
         "stateMutability": "view",
         "type": "function"
     },
     {
+        "constant": True,
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
+        "name": "getOutcomeSlotCount",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "payable": False,
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "constant": False,
         "inputs": [
-            {"name": "operator", "type": "address"},
-            {"name": "approved", "type": "bool"}
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"}
         ],
-        "name": "setApprovalForAll",
-        "outputs": [{"name": "", "type": "bool"}],
+        "name": "redeemPositions",
+        "outputs": [],
+        "payable": False,
         "stateMutability": "nonpayable",
         "type": "function"
     }

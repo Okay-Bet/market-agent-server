@@ -1,6 +1,7 @@
 # src/services/web3_service.py
-from web3 import Web3
 import asyncio
+from web3 import Web3
+from web3.contract import Contract
 from web3.middleware import ExtraDataToPOAMiddleware
 from ..config import (
     POLYGON_RPC, PRIVATE_KEY, USDC_ADDRESS, CTF_ADDRESS,
@@ -25,7 +26,7 @@ class Web3Service:
             'neg_risk_adapter': '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
         }
 
-        self.ctf = self.w3.eth.contract(
+        self.ctf: Contract = self.w3.eth.contract(
             address=Web3.to_checksum_address(CTF_ADDRESS),
             abi=CTF_ABI
         )
