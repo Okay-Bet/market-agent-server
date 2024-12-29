@@ -1,5 +1,8 @@
+import asyncio
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
+
+from ...services.market_service import MarketService
 from ...services.trader_service import TraderService
 from ...services.postgres_service import PostgresService
 from ...services.web3_service import Web3Service
@@ -8,6 +11,7 @@ from ...models.api import OrderRequest, OrderStatus
 from ...config import logger
 
 router = APIRouter()
+market_service = MarketService()
 trader_service = TraderService()
 postgres_service = PostgresService()
 web3_service = Web3Service()
@@ -62,49 +66,83 @@ async def submit_delegated_order(order: OrderRequest):
 @router.get("/api/user-orders/{address}")
 async def get_user_orders(address: str):
     """
-    Get user orders and positions, using our existing postgres service.
+    Get user orders and positions with enriched market data.
     """
     try:
-        # Debug log for incoming request
         logger.info(f"Receiving request for user positions: {address}")
-
+        
         # Get pending orders
         pending_orders = postgres_service.get_user_pending_orders(address)
         logger.info(f"Pending orders count: {len(pending_orders) if pending_orders else 0}")
-
+        
         # Get positions
         positions = postgres_service.get_user_positions(address)
         logger.info(f"Raw positions from database: {positions}")
-
-        # Transform positions into frontend format
-        completed_orders = []
-        for position in positions:
-            position_dict = {
-                "market_id": position['condition_id'],
-                "balances": [float(position['amount']) * 1_000_000],
-                "prices": [float(position['entry_price'])],
-                "outcome": position['outcome'],
-                "status": position['status'].lower(),
-                "user_address": position['user_address']
-            }
-            completed_orders.append(position_dict)
-
-        # Log the final response
+        
+        market_service = MarketService()
+        
+        async def enrich_position(position):
+            try:
+                # Use token_id instead of condition_id for market data fetch
+                if not position.get('token_id'):
+                    logger.warning(f"Position missing token_id for condition {position['condition_id']}")
+                    raise ValueError("Position missing token_id")
+                
+                # Fetch market data using token_id
+                market_data = await market_service.get_market(position['token_id'])
+                
+                return {
+                    "condition_id": position['condition_id'],
+                    "token_id": position['token_id'],  # Include token_id in response
+                    "balances": [float(position['amount']) * 1_000_000],
+                    "prices": [float(position['entry_price'])],
+                    "outcome": position['outcome'],
+                    "status": position['status'].lower(),
+                    "user_address": position['user_address'],
+                    "market_data": {
+                        "question": market_data["question"],
+                        "outcomes": market_data["outcomes"],
+                        "outcome_prices": market_data["outcome_prices"],
+                    }
+                }
+            except ValueError as e:
+                logger.warning(f"Could not fetch market data for position {position['condition_id']}: {str(e)}")
+                # Return position without market data if fetch fails
+                return {
+                    "condition_id": position['condition_id'],
+                    "token_id": position['token_id'],  # Include token_id even in error case
+                    "balances": [float(position['amount']) * 1_000_000],
+                    "prices": [float(position['entry_price'])],
+                    "outcome": position['outcome'],
+                    "status": position['status'].lower(),
+                    "user_address": position['user_address'],
+                }
+        
+        # Process all positions concurrently
+        completed_orders = await asyncio.gather(
+            *[enrich_position(position) for position in positions],
+            return_exceptions=True
+        )
+        
+        # Filter out any failed position enrichments
+        completed_orders = [
+            order for order in completed_orders
+            if not isinstance(order, Exception)
+        ]
+        
         response_data = {
             "pending_orders": pending_orders,
             "completed_orders": completed_orders
         }
         logger.info(f"Sending response: {response_data}")
-        
         return response_data
-
+        
     except Exception as e:
         logger.error(f"Error processing user orders: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error processing user orders: {str(e)}"
         )
-
 
 @router.get("/api/order-status/{order_id}")
 async def get_order_status(order_id: str):

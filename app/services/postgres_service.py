@@ -456,7 +456,7 @@ class PostgresService:
                         updated_at=datetime.utcnow()
                     )
                     db.add(user)
-                    db.flush()  # Ensure user is created before continuing
+                    db.flush()
                     logger.info(f"Created new user record for address: {user_address}")
 
                 # 2. Ensure market exists
@@ -469,13 +469,14 @@ class PostgresService:
                         condition_id=condition_id,
                         status='active',
                         total_volume_usdc=decimal.Decimal('0'),
-                        created_at=datetime.utcnow()
+                        created_at=datetime.utcnow(),
+                        token_id=position_data['token_id']  # Add token_id to new markets
                     )
                     db.add(market)
-                    db.flush()  # Ensure market is created before continuing
+                    db.flush()
                     logger.info(f"Created new market record for condition: {condition_id}")
 
-                # 3. Now create the position
+                # 3. Now create or update the position
                 amount = decimal.Decimal(str(position_data['amount']))
                 price = decimal.Decimal(str(position_data['price']))
                 current_time = datetime.utcnow()
@@ -497,6 +498,7 @@ class PostgresService:
                     existing_position.amount = total_amount
                     existing_position.total_cost_basis += cost_basis
                     existing_position.updated_at = current_time
+                    existing_position.token_id = position_data['token_id'] 
                 else:
                     # Create new position
                     new_position = Position(
@@ -513,7 +515,8 @@ class PostgresService:
                         status='active',
                         created_at=current_time,
                         updated_at=current_time,
-                        order_id=position_data['order_id']
+                        order_id=position_data['order_id'],
+                        token_id=position_data['token_id']  # Add token_id to new positions
                     )
                     db.add(new_position)
 
@@ -545,6 +548,7 @@ class PostgresService:
             result = [{
                 'user_address': pos.user_address,
                 'condition_id': pos.condition_id,
+                'token_id': pos.token_id,
                 'outcome': pos.outcome,
                 'amount': pos.amount,
                 'entry_price': pos.average_entry_price,

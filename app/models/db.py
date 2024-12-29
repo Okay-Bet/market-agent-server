@@ -58,6 +58,7 @@ class Position(Base):
     updated_at = Column(DateTime, nullable=False)
     redeemed_at = Column(DateTime, nullable=True)
     order_id = Column(String(66), nullable=True)
+    token_id = Column(String(256), nullable=True)
 
     __table_args__ = (
         UniqueConstraint('condition_id', 'user_address', 'outcome', 
@@ -67,6 +68,7 @@ class Position(Base):
         Index('ix_positions_status', 'status'),
         Index('ix_positions_user_address', 'user_address'),
         Index('ix_positions_user_market', 'user_address', 'condition_id'),
+        Index('ix_positions_token_id', 'token_id'), 
     )
 
 class Order(Base):
