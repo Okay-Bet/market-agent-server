@@ -173,23 +173,21 @@ async def validate_order(order: OrderRequest):
     try:
         logger.info(f"Validating order request: {order.dict()}")
         
-        # Calculate minimum order size based on price
-        min_token_amount = 5  # Always need 5 tokens minimum
-        min_usdc_amount = max(1.0, min_token_amount * order.price)  # Use $1 minimum if token amount would be less
-        min_order_size = int(min_usdc_amount * 1_000_000)  # Convert to base units
-        max_order_size = 1_000_000_000_000  # $1M in base units
-        
-        # Log minimum size calculation
+        # Calculate minimum order size
+        min_token_amount = 5
+        min_usdc_amount = max(1.0, min_token_amount * order.price)
+        min_order_size = int(min_usdc_amount * 1_000_000)
+        max_order_size = 1_000_000_000_000
+
         logger.info(f"""
-            Minimum Size Calculation:
-            - Price: {order.price}
-            - Min Tokens: {min_token_amount}
-            - Min USDC: {min_usdc_amount}
-            - Min Order Size (base units): {min_order_size}
-            - Requested Amount: {order.amount}
+        Minimum Size Calculation:
+        - Price: {order.price}
+        - Min Tokens: {min_token_amount}
+        - Min USDC: {min_usdc_amount}
+        - Min Order Size (base units): {min_order_size}
+        - Requested Amount: {order.amount}
         """)
 
-        # Validate minimum order size
         if int(order.amount) < min_order_size:
             return JSONResponse(
                 status_code=400,
@@ -197,7 +195,7 @@ async def validate_order(order: OrderRequest):
                     "valid": False,
                     "min_order_size": min_order_size,
                     "max_order_size": max_order_size,
-                    "error": f"Order size ${float(order.amount)/1_000_000:.4f} below minimum ${min_usdc_amount:.4f} (5 tokens at price {order.price})"
+                    "error": f"Order size ${float(order.amount)/1_000_000:.4f} below minimum ${min_usdc_amount:.4f}"
                 }
             )
 
@@ -206,10 +204,10 @@ async def validate_order(order: OrderRequest):
             order.token_id,
             float(order.amount) / 1_000_000,
             order.price,
-            order.side
+            order.side,
+            order.is_yes_token  # Kept for API compatibility but not used
         )
 
-        # Check if the impact analysis was successful
         if not impact_analysis.get("valid", False):
             return JSONResponse(
                 status_code=400,
@@ -217,20 +215,21 @@ async def validate_order(order: OrderRequest):
                     "valid": False,
                     "min_order_size": min_order_size,
                     "max_order_size": max_order_size,
-                    "error": impact_analysis.get("error", "Price impact calculation failed")
+                    "error": impact_analysis.get("error", "Price impact calculation failed"),
+                    "market_price": impact_analysis.get("market_price")
                 }
             )
 
-        # If we got here, we have a valid impact analysis
+        price_impact = impact_analysis.get("price_impact", 0)
         return {
             "valid": True,
             "min_order_size": min_order_size,
             "max_order_size": max_order_size,
             "estimated_total": impact_analysis.get("estimated_total", int(order.amount)),
-            "price_impact": impact_analysis.get("price_impact", 0),
+            "price_impact": price_impact,
             "execution_possible": impact_analysis.get("execution_possible", True),
-            "warning": None if impact_analysis.get("price_impact", 0) < 0.05 else 
-                      f"High price impact: {impact_analysis['price_impact']*100:.1f}%"
+            "warning": None if abs(price_impact) < 0.05 else f"High price impact: {price_impact*100:.1f}%",
+            "market_price": impact_analysis.get("market_price")
         }
 
     except Exception as e:
