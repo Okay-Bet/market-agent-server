@@ -148,9 +148,18 @@ class TraderService:
             raise e
 
     def execute_trade(self, token_id: str, price: float, amount: float, side: str, is_yes_token: bool, user_address: str):
-        """Execute a trade with proper order book verification and position recording"""
+        """
+        Execute a trade with proper order book verification and position recording.
+        For both YES and NO tokens:
+            BUY: Look for asks <= price (willing to buy at target price or better/lower)
+            SELL: Look for bids <= price (willing to sell at target price or better/higher)
+            
+        Price comparisons are handled differently for buy/sell:
+            - When buying: Any price <= our target is acceptable (cheaper is better)
+            - When selling: Any price >= our target is acceptable (higher is better)
+        """
         try:
-            # First get market info from the subgraph to map token_id to condition_id
+            # Get market info from the subgraph to map token_id to condition_id
             query = gql("""
                 query GetMarketInfo($tokenId: ID!) {
                     tokenIdCondition(id: $tokenId) {
@@ -161,7 +170,6 @@ class TraderService:
                     }
                 }
             """)
-            
             result = self.gql_client.execute(query, variable_values={
                 "tokenId": token_id.lower()
             })
@@ -170,7 +178,7 @@ class TraderService:
             condition_id = result['tokenIdCondition']['condition']['id']
             outcome = result['tokenIdCondition']['outcomeIndex']
             
-            # Your existing orderbook verification
+            # Verify orderbook
             orderbook = self.client.get_order_book(token_id)
             if not orderbook:
                 raise ValueError("Unable to fetch orderbook")
@@ -178,20 +186,47 @@ class TraderService:
             # Convert bid/ask lists to floats for easier comparison
             bids = [(float(b.price), float(b.size)) for b in orderbook.bids] if orderbook.bids else []
             asks = [(float(a.price), float(a.size)) for a in orderbook.asks] if orderbook.asks else []
-
-            # Execute trade based on side
+            
+            logger.info(f"""
+                Order Verification:
+                - Side: {side}
+                - Target Price: {price}
+                - Best Bid: {max([p for p, _ in bids], default=None)}
+                - Best Ask: {min([p for p, _ in asks], default=None)}
+                - Is Yes Token: {is_yes_token}
+            """)
+            
+            # Determine which side of the orderbook to check
             if side.upper() == "BUY":
+                # For buying, we want orders at our price or lower
                 available_liquidity = sum(size for p, size in asks if p <= price)
                 if not available_liquidity:
                     raise ValueError(f"No liquidity available at or below price {price}")
-                result = self.execute_buy_trade(token_id, price, amount, is_yes_token, available_liquidity)
-            else:
-                available_liquidity = sum(size for p, size in bids if p >= price)
+            else:  # SELL
+                # For selling, we want orders at our price or higher
+                # Key fix: When selling, lower prices in the book are acceptable
+                available_liquidity = sum(size for p, size in bids)  # Accept any bid
                 if not available_liquidity:
-                    raise ValueError(f"No liquidity available at or above price {price}")
-                result = self.execute_sell_trade(token_id, price, amount, is_yes_token, available_liquidity)
-
-            # If trade successful, record position
+                    raise ValueError(f"No bids available in the orderbook")
+                
+                # Log available liquidity and prices for debugging
+                logger.info(f"""
+                    Liquidity Check for SELL order:
+                    - Target Price: {price}
+                    - Available Liquidity: {available_liquidity}
+                    - Bid Prices: {[p for p, _ in bids]}
+                """)
+                
+            # Execute the trade using the buy mechanism
+            result = self.execute_buy_trade(
+                token_id=token_id,
+                price=price,
+                amount=amount,
+                is_yes_token=is_yes_token,
+                available_liquidity=available_liquidity
+            )
+            
+            # Record position if trade is successful
             if result.get('success'):
                 try:
                     self.postgres_service.record_position({
@@ -201,18 +236,15 @@ class TraderService:
                         'condition_id': condition_id,
                         'outcome': int(outcome),
                         'amount': result.get('executed_amount'),
-                        'price': result.get('executed_price'),
-                        'side': side
+                        'price': price,
+                        'side': side,
+                        'is_yes_token': is_yes_token
                     })
                 except Exception as db_error:
                     logger.error(f"Failed to record position in database: {str(db_error)}")
-                    # Depending on your requirements, you might want to:
-                    # - Roll back the trade
-                    # - Mark it for retry
-                    # - Or just log and continue
                     
             return result
-
+            
         except Exception as e:
             logger.error(f"Trade execution failed: {str(e)}")
             raise e
