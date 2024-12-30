@@ -200,8 +200,8 @@ class TraderService:
                         'token_id': token_id,
                         'condition_id': condition_id,
                         'outcome': int(outcome),
-                        'amount': amount,
-                        'price': price,
+                        'amount': result.get('executed_amount'),
+                        'price': result.get('executed_price'),
                         'side': side
                     })
                 except Exception as db_error:
@@ -235,34 +235,37 @@ class TraderService:
             - Target price: {price}
             - Available liquidity: {available_liquidity}
             """)
-
-            # Create market order with USDC amount
+            
+            # Store pre-trade orderbook state
+            orderbook = self.client.get_order_book(token_id)
+            best_ask = min([ask.price for ask in orderbook.asks]) if orderbook.asks else None
+            
             order_args = MarketOrderArgs(
                 token_id=token_id,
-                amount=amount  # This is USDC amount, not token amount
+                amount=amount
             )
             
-            logger.info(f"Creating market order with {amount} USDC")
-            
             signed_order = self.client.create_market_order(order_args)
-            if not signed_order:
-                raise ValueError("Failed to create signed order")
+            post_response = self.client.post_order(signed_order, OrderType.FOK)
             
-            logger.info("Posting order to CLOB")
-            response = self.client.post_order(signed_order, OrderType.FOK)
-            
-            if not response:
-                raise ValueError("No response received from order placement")
-            
-            if response.get("errorMsg"):
-                raise ValueError(f"Order placement failed: {response['errorMsg']}")
-            
-            return {
-                "success": True,
-                "order_id": response.get("orderID"),
-                "status": response.get("status")
-            }
+            # Get post-trade orderbook and last trade price
+            last_trade = self.client.get_last_trade_price(token_id)
 
+            token_amount = amount / price if price > 0 else 0
+            
+            execution_details = {
+                "success": True,
+                "order_id": post_response.get("orderID"),
+                "status": post_response.get("status"),
+                "executed_price": last_trade.get("price") if last_trade else best_ask,
+                "executed_amount": token_amount, # amount of tokens bought
+                "original_amount": amount, # amount of usdc paid
+                "original_price": price
+            }
+            
+            logger.info(f"Trade Execution Details: {execution_details}")
+            return execution_details
+            
         except Exception as e:
             logger.error(f"Buy trade execution failed: {str(e)}")
             raise e
