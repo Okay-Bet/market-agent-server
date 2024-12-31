@@ -1,8 +1,9 @@
 # src/services/sell_service.py
 import asyncio
 from decimal import Decimal
+import time
 from web3 import Web3
-from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType, MarketOrderArgs
 from py_clob_client.order_builder.constants import SELL
 from ..config import logger, PRIVATE_KEY
 from .web3_service import Web3Service
@@ -27,6 +28,22 @@ class SellService:
             user_address: Address to receive the proceeds
         """
         try:
+
+            if not hasattr(self.trader_service.client, 'creds') or not self.trader_service.client.creds:
+                logger.error("Client credentials not properly initialized")
+                raise ValueError("Authentication not properly initialized")
+
+            # Verify Level 2 auth before proceeding
+            try:
+                self.trader_service.client.assert_level_2_auth()
+            except Exception as auth_error:
+                logger.error(f"Level 2 authentication failed: {str(auth_error)}")
+                # Re-initialize credentials
+                self.trader_service.credentials = self.trader_service.client.create_or_derive_api_creds()
+                self.trader_service.client.set_api_creds(self.trader_service.credentials)
+                # Verify again
+                self.trader_service.client.assert_level_2_auth()
+
             # Validate user address for later transfer
             if not Web3.is_address(user_address):
                 raise ValueError("Invalid user address")
@@ -62,9 +79,18 @@ class SellService:
             orderbook = self.trader_service.client.get_order_book(token_id)
             if not orderbook.bids:
                 raise ValueError("No buy orders available in orderbook")
-            
-            best_bid = float(orderbook.bids[0].price)
-            logger.info(f"Best bid price: {best_bid}")
+
+            # Sort bids by price (highest first)
+            sorted_bids = sorted(
+                [(float(b.price), float(b.size)) for b in orderbook.bids],
+                key=lambda x: x[0],
+                reverse=True
+            )
+            if not sorted_bids:
+                raise ValueError("No valid bids after sorting")
+
+            best_bid = sorted_bids[0][0]
+            logger.info(f"Best bid after sorting: {best_bid}")
 
             if float(price) < best_bid * 0.99:  # 1% tolerance
                 raise ValueError(f"Sell price ({price}) too low compared to best bid ({best_bid})")
@@ -123,24 +149,43 @@ class SellService:
                     """)
 
                     # Step 4: Create and execute order
+                    logger.info("Creating signed order with explicit parameters")
                     order_args = OrderArgs(
                         token_id=token_id,
-                        side=SELL,
-                        price=float(price),
+                        side="SELL",  # Explicit side declaration
+                        price=float(best_bid),  # Use best bid price for immediate execution
                         size=float(tokens_to_sell),
-                        fee_rate_bps=0,
-                        nonce=0,
-                        expiration=0
+                        fee_rate_bps=0
                     )
-                    
-                    logger.info("Creating signed order")
-                    signed_order = self.trader_service.client.create_order(order_args)
-                    
-                    logger.info("Submitting order with GTC type")
-                    response = self.trader_service.client.post_order(signed_order, OrderType.GTC)
-                    
-                    if response.get("errorMsg"):
-                        raise ValueError(f"Order placement failed: {response['errorMsg']}")
+                    logger.info(f"Market order arguments: {order_args.__dict__}")
+
+
+                    # Create order with explicit options
+                    try:
+                        # Create market order - simpler than limit order creation
+                        signed_order = self.trader_service.client.create_order(order_args)
+                        logger.info(f"Signed market order created: {signed_order}")
+                    except Exception as create_error:
+                        logger.error(f"Market order creation failed: {str(create_error)}", exc_info=True)
+                        raise ValueError(f"Failed to create market order: {str(create_error)}")
+
+                    # Post order with explicit headers
+                    try:
+                        # Post order
+                        logger.info("Submitting market order")
+                        response = self.trader_service.client.post_order(signed_order, OrderType.GTC)
+                        logger.info(f"Market order submission response: {response}")
+                            
+                        if not response:
+                            raise ValueError("Empty response from order submission")
+                                
+                        if isinstance(response, dict) and (response.get('error') or response.get('errorMsg')):
+                            raise ValueError(f"Order submission failed: {response.get('error') or response.get('errorMsg')}")
+                    except Exception as post_error:
+                        logger.error(f"Market order submission failed: {str(post_error)}", exc_info=True)
+                        raise ValueError(f"Failed to submit market order: {str(post_error)}")
+                        
+                    logger.info(f"Order post response: {response}")
                     
                     logger.info(f"Order successfully placed: {response}")
 
