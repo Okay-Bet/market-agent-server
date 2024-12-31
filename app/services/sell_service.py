@@ -11,6 +11,8 @@ class SellService:
     def __init__(self, trader_service):
         self.trader_service = trader_service
         self.web3_service = Web3Service()
+        self.TOKEN_DECIMALS = 1_000_000
+        self.USDC_DECIMALS = 1_000_000
 
 
     async def execute_delegated_sell(self, token_id: str, price: float, amount: int, is_yes_token: bool, user_address: str):
@@ -68,9 +70,17 @@ class SellService:
                 raise ValueError(f"Sell price ({price}) too low compared to best bid ({best_bid})")
 
             # Step 3: Calculate amounts and verify balance
-            usdc_decimal = float(amount) / 1_000_000  # Convert from base units
-            tokens_to_sell = usdc_decimal / float(price)
-            
+             # Calculate actual token amount from USDC amount
+            usdc_decimal = amount / self.USDC_DECIMALS  # Convert USDC to decimal
+            tokens_to_sell = usdc_decimal / price       # Calculate number of tokens needed
+            tokens_to_sell_base = int(tokens_to_sell * self.TOKEN_DECIMALS)  # Convert to base units for balance check
+
+            # Minimum order size check (5 tokens)
+            MIN_ORDER_SIZE = 5.0
+            if tokens_to_sell < MIN_ORDER_SIZE:
+                raise ValueError(f"Order size ({tokens_to_sell:.2f} tokens) is below minimum size of {MIN_ORDER_SIZE} tokens")
+
+
             # Update and verify balance allowance (using server's balance)
             MAX_RETRIES = 3
             last_error = None
@@ -96,23 +106,20 @@ class SellService:
                     if not current_balance or 'balance' not in current_balance:
                         raise ValueError("Failed to fetch current balance")
                     
-                    balance = float(current_balance.get('balance', '0'))
-                    
-                    if balance <= 0:
-                        raise ValueError("Insufficient token balance for trade")
-                    
-                    if tokens_to_sell > balance:
-                        raise ValueError(
-                            f"Insufficient balance. Have: {balance}, Need: {tokens_to_sell}"
-                        )
+                    # Get balance in base units
+                    balance_base = int(current_balance.get('balance', '0'))
+                    balance_decimal = balance_base / self.TOKEN_DECIMALS
                     
                     logger.info(f"""
                     Trade parameters:
-                    USDC desired: {usdc_decimal}
-                    Price per token: {price}
-                    Best bid price: {best_bid}
-                    Tokens to sell: {tokens_to_sell}
-                    Available balance: {balance}
+                    USDC input (base units): {amount}
+                    USDC input (decimal): {usdc_decimal:.4f}
+                    Price per token: {price:.4f} USDC
+                    Tokens to sell (decimal): {tokens_to_sell:.4f}
+                    Tokens to sell (base): {tokens_to_sell_base}
+                    Available balance (base): {balance_base}
+                    Available balance (decimal): {balance_decimal:.4f}
+                    Best bid: {best_bid}
                     """)
 
                     # Step 4: Create and execute order
