@@ -201,6 +201,18 @@ class SellService:
                         if isinstance(response, dict) and (response.get('error') or response.get('errorMsg')):
                             raise ValueError(f"Order submission failed: {response.get('error') or response.get('errorMsg')}")
                         
+                        # Extract actual received amount from order response
+                        actual_usdc_received = float(response.get('takingAmount', 0))
+                        if actual_usdc_received <= 0:
+                            raise ValueError("Invalid USDC amount received from trade")
+                        
+                        logger.info(f"""
+                        Trade execution details:
+                        Expected USDC: {usdc_decimal}
+                        Actually received: {actual_usdc_received}
+                        Difference: {actual_usdc_received - usdc_decimal}
+                        """)
+                        
                         # After successful order execution, close the position in database
                         try:
                             self.postgres_service.close_position({
@@ -223,7 +235,7 @@ class SellService:
                     logger.info(f"Order successfully placed: {response}")
 
                     # After successful order, transfer proceeds to user
-                    usdc_amount = int(usdc_decimal * 1_000_000)  # Convert back to base units
+                    usdc_amount = int(actual_usdc_received * self.USDC_DECIMALS)   # Convert back to base units
                     transfer_result = await self._transfer_proceeds_to_user(user_address, usdc_amount)
                     
                     return {
@@ -233,6 +245,7 @@ class SellService:
                         "details": {
                             "tokens_sold": tokens_to_sell,
                             "expected_usdc": usdc_decimal,
+                            "actual_usdc": actual_usdc_received,
                             "price": price,
                             "best_bid": best_bid,
                             "transaction_hashes": response.get("transactionsHashes", [])
