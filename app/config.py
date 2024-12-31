@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 PRIVATE_KEY = os.getenv("POLYGON_WALLET_PRIVATE_KEY")
 if not PRIVATE_KEY:
     raise ValueError("POLYGON_WALLET_PRIVATE_KEY not set in environment")
+CHAIN_ID=137
 
 # Contract addresses
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"

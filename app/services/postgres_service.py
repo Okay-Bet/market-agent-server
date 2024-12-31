@@ -678,3 +678,81 @@ class PostgresService:
         except SQLAlchemyError as e:
             logger.error(f"Failed to fetch winning positions for market {condition_id}: {str(e)}")
             raise
+
+    def close_position(self, position_data: Dict[str, Any]) -> None:
+        """
+        Marks a position as closed and updates related metrics after a successful sale.
+        
+        Args:
+            position_data: Dictionary containing:
+                - token_id: The market token ID
+                - user_address: Address of the position holder
+                - exit_price: The price at which the position was sold
+                - amount: The amount of tokens sold
+                - transaction_hash: The transaction hash of the sale
+        
+        Raises:
+            ValueError: If position not found or invalid data
+            SQLAlchemyError: For database operation failures
+        """
+        db = self.get_db()
+        try:
+            # Find and lock the active position
+            position = db.query(Position).filter(
+                Position.token_id == position_data['token_id'],
+                Position.user_address == position_data['user_address'],
+                Position.status == 'active'
+            ).with_for_update().first()
+            
+            if not position:
+                raise ValueError(f"No active position found for token {position_data['token_id']}")
+                
+            # Convert all numerical values to Decimal for precise calculations
+            exit_price = decimal.Decimal(str(position_data['exit_price']))
+            amount_sold = decimal.Decimal(str(position_data['amount']))
+            
+            # Calculate trade metrics
+            trade_volume_usdc = amount_sold * exit_price  # Volume in USDC terms
+            trade_pnl = (exit_price - position.average_entry_price) * amount_sold
+            
+            current_time = datetime.utcnow()
+            
+            # Update position record
+            position.status = 'closed'
+            position.realized_pnl = position.realized_pnl + trade_pnl
+            position.updated_at = current_time
+            position.transfer_tx = position_data.get('transaction_hash')
+            
+            # Find and lock the user record for update
+            user = db.query(User).filter(
+                User.address == position_data['user_address']
+            ).with_for_update().first()
+            
+            if not user:
+                logger.error(f"User record not found for address {position_data['user_address']}")
+                raise ValueError("User record not found")
+            
+            # Update all user metrics
+            user.total_volume_usdc += trade_volume_usdc
+            user.total_realized_pnl += trade_pnl
+            user.total_trades += 1
+            user.updated_at = current_time
+                
+            # Commit all changes in a single transaction
+            db.commit()
+            
+            logger.info(f"""
+            Position closed successfully:
+            User: {position_data['user_address']}
+            Token: {position_data['token_id']}
+            Volume: {trade_volume_usdc} USDC
+            PnL: {trade_pnl} USDC
+            Total trades: {user.total_trades}
+            """)
+            
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to close position: {str(e)}", exc_info=True)
+            raise
+        finally:
+            db.close()

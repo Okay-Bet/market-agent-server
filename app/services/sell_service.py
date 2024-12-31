@@ -7,11 +7,15 @@ from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowancePara
 from py_clob_client.order_builder.constants import SELL
 from ..config import logger, PRIVATE_KEY
 from .web3_service import Web3Service
+from .position_verification_service import PositionVerificationService
+from .postgres_service import PostgresService 
 
 class SellService:
     def __init__(self, trader_service):
         self.trader_service = trader_service
         self.web3_service = Web3Service()
+        self.position_verification = PositionVerificationService()
+        self.postgres_service = PostgresService()
         self.TOKEN_DECIMALS = 1_000_000
         self.USDC_DECIMALS = 1_000_000
 
@@ -48,6 +52,25 @@ class SellService:
             if not Web3.is_address(user_address):
                 raise ValueError("Invalid user address")
             user_address = Web3.to_checksum_address(user_address)
+             # Calculate actual token amount from USDC amount
+            usdc_decimal = amount / self.USDC_DECIMALS  # Convert USDC to decimal
+            tokens_to_sell = usdc_decimal / price       # Calculate number of tokens needed
+            tokens_to_sell_base = int(tokens_to_sell * self.TOKEN_DECIMALS)  # Convert to base units for balance check
+            # Step 0: Verify position ownership and amounts
+            try:
+                position = await self.position_verification.verify_position_ownership(
+                    token_id=token_id,
+                    user_address=user_address,
+                    tokens_to_sell=tokens_to_sell
+                )
+                logger.info(f"Position verified: {position.id} for {tokens_to_sell} tokens")
+            except ValueError as ve:
+                logger.error(f"Position verification failed: {str(ve)}")
+                raise ValueError(f"Position verification failed: {str(ve)}")
+
+            if not hasattr(self.trader_service.client, 'creds') or not self.trader_service.client.creds:
+                logger.error("Client credentials not properly initialized")
+                raise ValueError("Authentication not properly initialized")
 
             # Step 1: Check all contract approvals
             approvals = self.web3_service.check_all_approvals()
@@ -96,10 +119,6 @@ class SellService:
                 raise ValueError(f"Sell price ({price}) too low compared to best bid ({best_bid})")
 
             # Step 3: Calculate amounts and verify balance
-             # Calculate actual token amount from USDC amount
-            usdc_decimal = amount / self.USDC_DECIMALS  # Convert USDC to decimal
-            tokens_to_sell = usdc_decimal / price       # Calculate number of tokens needed
-            tokens_to_sell_base = int(tokens_to_sell * self.TOKEN_DECIMALS)  # Convert to base units for balance check
 
             # Minimum order size check (5 tokens)
             MIN_ORDER_SIZE = 5.0
@@ -181,6 +200,20 @@ class SellService:
                                 
                         if isinstance(response, dict) and (response.get('error') or response.get('errorMsg')):
                             raise ValueError(f"Order submission failed: {response.get('error') or response.get('errorMsg')}")
+                        
+                        # After successful order execution, close the position in database
+                        try:
+                            self.postgres_service.close_position({
+                                'token_id': token_id,
+                                'user_address': user_address,
+                                'exit_price': float(best_bid),  # Using best_bid as actual execution price
+                                'amount': tokens_to_sell,
+                                'transaction_hash': response.get('transactionHash', response.get('orderID'))  # Fallback to orderID if hash not available
+                            })
+                            logger.info(f"Successfully closed position in database for token {token_id}")
+                        except Exception as db_error:
+                            logger.error(f"Failed to close position in database: {str(db_error)}")
+
                     except Exception as post_error:
                         logger.error(f"Market order submission failed: {str(post_error)}", exc_info=True)
                         raise ValueError(f"Failed to submit market order: {str(post_error)}")
@@ -204,7 +237,8 @@ class SellService:
                             "best_bid": best_bid,
                             "transaction_hashes": response.get("transactionsHashes", [])
                         },
-                        "transfer": transfer_result
+                        "transfer": transfer_result,
+                        "position_id": str(position.id)
                     }
 
                 except Exception as e:
