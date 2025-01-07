@@ -3,6 +3,7 @@ from .routes.health import router as health_router
 from .routes.status import router as status_router
 from .routes.positions import router as positions_router
 from .routes.orders import router as orders_router
+from .routes.bridge import router as bridge_router
 from .routes.resolve import router as resolve_router
 
 router = APIRouter()

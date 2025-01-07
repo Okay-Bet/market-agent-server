@@ -46,6 +46,7 @@ CHAIN_ID=137
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 EXCHANGE_ADDRESS = "0x4bfb41d5B3570defd03c39a9A4d8de6bd8b8982e"
+ACROSS_SPOKE_POOL_ADDRESS= "0x9295ee1d8C5b022Be115A2AD3c30C72E34e7F096"
 POLYGON_RPC = "https://polygon-rpc.com"
 GAMMA_URL = "https://gamma-api.polymarket.com"
 GAMMA_MARKETS_ENDPOINT = f"{GAMMA_URL}/markets"
@@ -120,5 +121,69 @@ CTF_ABI = [
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function"
+    }
+]
+
+ACROSS_SPOKE_POOL_ABI = [
+    {
+        "inputs": [
+            {"name": "depositor", "type": "address"},
+            {"name": "recipient", "type": "address"},
+            {"name": "inputToken", "type": "address"},
+            {"name": "outputToken", "type": "address"},
+            {"name": "inputAmount", "type": "uint256"},
+            {"name": "outputAmount", "type": "uint256"},
+            {"name": "destinationChainId", "type": "uint256"},
+            {"name": "exclusiveRelayer", "type": "address"},
+            {"name": "quoteTimestamp", "type": "uint32"},
+            {"name": "fillDeadline", "type": "uint32"},
+            {"name": "exclusivityDeadline", "type": "uint32"},
+            {"name": "message", "type": "bytes"}
+        ],
+        "name": "depositV3",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getCurrentTime",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "depositQuoteTimeBuffer",
+        "outputs": [{"name": "", "type": "uint32"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "fillDeadlineBuffer",
+        "outputs": [{"name": "", "type": "uint32"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": False, "name": "inputToken", "type": "address"},
+            {"indexed": False, "name": "outputToken", "type": "address"},
+            {"indexed": False, "name": "inputAmount", "type": "uint256"},
+            {"indexed": False, "name": "outputAmount", "type": "uint256"},
+            {"indexed": True, "name": "destinationChainId", "type": "uint256"},
+            {"indexed": True, "name": "depositId", "type": "uint32"},
+            {"indexed": False, "name": "quoteTimestamp", "type": "uint32"},
+            {"indexed": False, "name": "fillDeadline", "type": "uint32"},
+            {"indexed": False, "name": "exclusivityDeadline", "type": "uint32"},
+            {"indexed": True, "name": "depositor", "type": "address"},
+            {"indexed": False, "name": "recipient", "type": "address"},
+            {"indexed": False, "name": "exclusiveRelayer", "type": "address"},
+            {"indexed": False, "name": "message", "type": "bytes"}
+        ],
+        "name": "V3FundsDeposited",
+        "type": "event"
     }
 ]
