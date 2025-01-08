@@ -12,6 +12,7 @@ from .api.routes.delegated_orders import router as delegated_orders_router
 from .api.routes.delegated_sell import router as delegated_sell_router
 from .api.routes.resolution import router as resolution_router
 from .api.routes.bridge import router as bridge_router
+from .api.routes.swap import router as swap_router
 from .services.web3_service import Web3Service
 from .services.postgres_service import PostgresService
 from .services.market_resolution import MarketResolutionService
@@ -91,6 +92,7 @@ app.include_router(orders_router)
 app.include_router(delegated_orders_router)
 app.include_router(delegated_sell_router)
 app.include_router(bridge_router)
+app.include_router(swap_router)
 app.include_router(resolution_router)
 
 if __name__ == "__main__":

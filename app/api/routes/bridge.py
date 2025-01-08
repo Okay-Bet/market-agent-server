@@ -376,3 +376,63 @@ async def test_bridge_transfer(
     except Exception as e:
         logger.error(f"Test bridge failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/swap/test-swap")
+async def test_swap(
+    amount: int = Body(..., description="Amount in USDC.e base units (6 decimals)"),
+    slippage: float = Body(0.5, description="Slippage tolerance in percent")
+):
+    """
+    Test endpoint for swapping USDC.e to USDC.
+    Only use small amounts (e.g., 1-10 USDC) for testing.
+    """
+    try:
+        # Input validation
+        if amount > 10_000_000:  # Max 10 USDC for testing
+            raise HTTPException(
+                status_code=400, 
+                detail="Test amount too high. Please use less than 10 USDC.e for testing."
+            )
+
+        if slippage < 0 or slippage > 5:
+            raise HTTPException(
+                status_code=400,
+                detail="Slippage must be between 0 and 5 percent"
+            )
+
+        logger.info(f"""
+        Starting swap test:
+        Amount: {amount} ({amount/1_000_000} USDC.e)
+        Slippage: {slippage}%
+        """)
+
+        # Check USDC.e balance first
+        usdc_e_balance = web3_service.usdc.functions.balanceOf(web3_service.wallet_address).call()
+        if usdc_e_balance < amount:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient USDC.e balance. Have: {usdc_e_balance/1_000_000}, Need: {amount/1_000_000}"
+            )
+
+        # Execute swap
+        try:
+            swap_result = await web3_service.swap_usdc_variants(amount, slippage)
+            
+            return {
+                "status": "success",
+                "details": {
+                    "input_amount": amount/1_000_000,
+                    "expected_output": swap_result['expected_output']/1_000_000,
+                    "transaction_hash": swap_result['transaction_hash'],
+                    "gas_used": swap_result['gas_used']
+                }
+            }
+        except Exception as e:
+            logger.error(f"Swap execution failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Test swap failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

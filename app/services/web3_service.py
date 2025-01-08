@@ -1,5 +1,6 @@
 # src/services/web3_service.py
 import asyncio
+import time
 from web3 import Web3
 from web3.contract import Contract
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -43,6 +44,38 @@ class Web3Service:
             'neg_risk_adapter': '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296',
             'across_spoke_pool': ACROSS_SPOKE_POOL_ADDRESS
         }
+
+        self.QUICKSWAP_ROUTER = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff"
+        self.ROUTER_ABI = [
+            {
+                "inputs": [
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+                    {"internalType": "address[]", "name": "path", "type": "address[]"},
+                    {"internalType": "address", "name": "to", "type": "address"},
+                    {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+                ],
+                "name": "swapExactTokensForTokens",
+                "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            },
+            {
+                "inputs": [
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "address[]", "name": "path", "type": "address[]"}
+                ],
+                "name": "getAmountsOut",
+                "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+
+        self.router = self.w3.eth.contract(
+            address=Web3.to_checksum_address(self.QUICKSWAP_ROUTER),
+            abi=self.ROUTER_ABI
+        )
 
     async def transfer_usdc(self, to_address: str, amount: int) -> dict:
         """
@@ -289,130 +322,152 @@ class Web3Service:
             logger.error(f"Failed to check approvals: {str(e)}")
             raise
 
-    async def approve_token(self, token_contract: Contract, spender_address: str, amount: int) -> dict:
+    async def approve_token(self, token_contract: Contract, spender_address: str, amount: int, max_retries: int = 3) -> dict:
         """
-        Approve token spending with robust gas handling for Polygon network
+        Approve token spending with retry mechanism and exponential backoff
         
         Args:
             token_contract: The token contract instance
             spender_address: Address to approve for spending
             amount: Amount to approve (in base units)
-                
+            max_retries: Maximum number of retry attempts
+                    
         Returns:
             dict: Transaction receipt details
         """
-        try:
-            spender = Web3.to_checksum_address(spender_address)
-            logger.info(f"Starting approval process for {amount} tokens for spender {spender}")
-            
-            # Get current allowance
-            current_allowance = token_contract.functions.allowance(
-                self.wallet_address,
-                spender
-            ).call()
-            
-            logger.info(f"Current allowance: {current_allowance} base units")
-            
-            def build_tx(func, gas_multiplier=1.5):
-                """Helper to build transaction with appropriate gas settings"""
-                # Get latest gas parameters
-                latest_block = self.w3.eth.get_block('latest')
-                base_fee = latest_block['baseFeePerGas']
+        async def execute_approval(retry_count: int = 0) -> dict:
+            try:
+                spender = Web3.to_checksum_address(spender_address)
+                logger.info(f"Attempt {retry_count + 1}: Starting approval process for {amount} tokens for spender {spender}")
                 
-                # Use much higher priority fee for Polygon
-                priority_fee = 100_000_000_000  # 100 gwei
-                max_fee = int(base_fee * 2.5 + priority_fee)  # More aggressive max fee
+                # Get current allowance
+                current_allowance = token_contract.functions.allowance(
+                    self.wallet_address,
+                    spender
+                ).call()
                 
-                # Estimate gas with a safety margin
-                gas_estimate = func.estimate_gas({
-                    'from': self.wallet_address,
-                    'maxFeePerGas': max_fee,
-                    'maxPriorityFeePerGas': priority_fee
-                })
-                gas_limit = int(gas_estimate * gas_multiplier)
+                logger.info(f"Current allowance: {current_allowance} base units")
                 
-                return func.build_transaction({
-                    'chainId': 137,
-                    'gas': gas_limit,
-                    'maxFeePerGas': max_fee,
-                    'maxPriorityFeePerGas': priority_fee,
-                    'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
-                    'from': self.wallet_address
-                })
+                def build_tx(func, gas_multiplier=1.5):
+                    """Helper to build transaction with appropriate gas settings"""
+                    # Increase gas settings with each retry
+                    retry_multiplier = 1 + (retry_count * 0.5)  # Increase gas by 50% each retry
+                    
+                    latest_block = self.w3.eth.get_block('latest')
+                    base_fee = latest_block['baseFeePerGas']
+                    
+                    # Increase priority fee with each retry
+                    priority_fee = int(100_000_000_000 * retry_multiplier)  # Start at 100 gwei and increase
+                    max_fee = int(base_fee * 5 * retry_multiplier + priority_fee)
+                    
+                    gas_estimate = func.estimate_gas({
+                        'from': self.wallet_address,
+                        'maxFeePerGas': max_fee,
+                        'maxPriorityFeePerGas': priority_fee
+                    })
+                    gas_limit = int(gas_estimate * gas_multiplier * retry_multiplier)
+                    
+                    return func.build_transaction({
+                        'chainId': 137,
+                        'gas': gas_limit,
+                        'maxFeePerGas': max_fee,
+                        'maxPriorityFeePerGas': priority_fee,
+                        'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                        'from': self.wallet_address
+                    })
 
-            # First reset allowance if needed
-            if current_allowance > 0:
-                logger.info("Resetting allowance to 0")
-                reset_func = token_contract.functions.approve(spender, 0)
-                reset_txn = build_tx(reset_func)
+                # Reset allowance if needed
+                if current_allowance > 0:
+                    logger.info(f"Attempt {retry_count + 1}: Resetting allowance to 0")
+                    reset_func = token_contract.functions.approve(spender, 0)
+                    reset_txn = build_tx(reset_func)
+                    
+                    signed_reset = self.w3.eth.account.sign_transaction(reset_txn, PRIVATE_KEY)
+                    reset_hash = self.w3.eth.send_raw_transaction(signed_reset.raw_transaction)
+                    
+                    # Wait for reset with timeout
+                    timeout = 30 * (retry_count + 1)  # Increase timeout with each retry
+                    try:
+                        async with asyncio.timeout(timeout):
+                            while True:
+                                try:
+                                    reset_receipt = self.w3.eth.get_transaction_receipt(reset_hash)
+                                    if reset_receipt:
+                                        if reset_receipt['status'] != 1:
+                                            raise ValueError("Reset allowance transaction failed")
+                                        logger.info(f"Attempt {retry_count + 1}: Successfully reset allowance to 0")
+                                        break
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(3)
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(f"Reset allowance transaction timed out after {timeout} seconds")
+
+                    # Add delay between reset and new approval
+                    await asyncio.sleep(3 * (retry_count + 1))
+
+                # Set new approval
+                logger.info(f"Attempt {retry_count + 1}: Setting new approval to maximum value")
+                max_uint256 = 2**256 - 1
                 
-                signed_reset = self.w3.eth.account.sign_transaction(reset_txn, PRIVATE_KEY)
-                reset_hash = self.w3.eth.send_raw_transaction(signed_reset.raw_transaction)
+                approve_func = token_contract.functions.approve(spender, max_uint256)
+                approve_txn = build_tx(approve_func)
                 
+                signed_txn = self.w3.eth.account.sign_transaction(approve_txn, PRIVATE_KEY)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+                
+                logger.info(f"Attempt {retry_count + 1}: Approval transaction sent: {tx_hash.hex()}")
+                
+                # Wait for approval with timeout
+                timeout = 30 * (retry_count + 1)
                 try:
-                    # Increased timeout and added polling
-                    for _ in range(30):  # 5 minutes total
-                        try:
-                            reset_receipt = self.w3.eth.get_transaction_receipt(reset_hash)
-                            if reset_receipt:
-                                if reset_receipt['status'] != 1:
-                                    raise ValueError("Reset allowance transaction failed")
-                                logger.info("Successfully reset allowance to 0")
-                                break
-                        except Exception:
-                            pass
-                        await asyncio.sleep(10)  # Wait 10 seconds between checks
-                    else:
-                        raise TimeoutError("Reset allowance transaction timed out")
-                except Exception as e:
-                    logger.error(f"Reset allowance failed: {str(e)}")
+                    async with asyncio.timeout(timeout):
+                        while True:
+                            try:
+                                receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+                                if receipt:
+                                    if receipt['status'] != 1:
+                                        raise ValueError("Approval transaction failed")
+                                    logger.info(f"Attempt {retry_count + 1}: Approval transaction confirmed in block {receipt['blockNumber']}")
+                                    break
+                            except Exception:
+                                pass
+                            await asyncio.sleep(3)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(f"Approval transaction timed out after {timeout} seconds")
+                
+                # Verify final allowance
+                final_allowance = token_contract.functions.allowance(
+                    self.wallet_address,
+                    spender
+                ).call()
+                
+                logger.info(f"Attempt {retry_count + 1}: Final allowance verified: {final_allowance} base units")
+                
+                if final_allowance < amount:
+                    raise ValueError(f"Final allowance ({final_allowance}) less than required ({amount})")
+
+                return {
+                    "success": True,
+                    "transaction_hash": receipt['transactionHash'].hex(),
+                    "gas_used": receipt['gasUsed'],
+                    "final_allowance": final_allowance
+                }
+
+            except Exception as e:
+                if retry_count < max_retries - 1:
+                    # Calculate exponential backoff delay
+                    delay = 3 * (2 ** retry_count)  # 3s, 6s, 12s, etc.
+                    logger.warning(f"Approval attempt {retry_count + 1} failed: {str(e)}")
+                    logger.info(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    return await execute_approval(retry_count + 1)
+                else:
+                    logger.error(f"All approval attempts failed after {max_retries} tries")
                     raise
 
-            # Now set new approval
-            logger.info("Setting new approval to maximum value")
-            max_uint256 = 2**256 - 1
-            
-            approve_func = token_contract.functions.approve(spender, max_uint256)
-            approve_txn = build_tx(approve_func)
-            
-            signed_txn = self.w3.eth.account.sign_transaction(approve_txn, PRIVATE_KEY)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            
-            logger.info(f"Approval transaction sent: {tx_hash.hex()}")
-            
-            # Wait for receipt with increased timeout and polling
-            for _ in range(30):  # 5 minutes total
-                try:
-                    receipt = self.w3.eth.get_transaction_receipt(tx_hash)
-                    if receipt:
-                        if receipt['status'] != 1:
-                            raise ValueError("Approval transaction failed")
-                        logger.info(f"Approval transaction confirmed in block {receipt['blockNumber']}")
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(10)  # Wait 10 seconds between checks
-            else:
-                raise TimeoutError("Approval transaction timed out")
-            
-            # Verify final allowance
-            final_allowance = token_contract.functions.allowance(
-                self.wallet_address,
-                spender
-            ).call()
-            
-            logger.info(f"Final allowance verified: {final_allowance} base units")
-            
-            if final_allowance < amount:
-                raise ValueError(f"Final allowance ({final_allowance}) less than required ({amount})")
-
-            return {
-                "success": True,
-                "transaction_hash": receipt['transactionHash'].hex(),
-                "gas_used": receipt['gasUsed'],
-                "final_allowance": final_allowance
-            }
-
+        try:
+            return await execute_approval()
         except Exception as e:
             logger.error(f"Token approval failed: {str(e)}")
             raise ValueError(f"Failed to approve token: {str(e)}")
@@ -561,3 +616,356 @@ class Web3Service:
         except Exception as e:
             logger.error(f"Bridge deposit failed: {str(e)}")
             raise ValueError(f"Failed to execute bridge deposit: {str(e)}")
+
+    async def swap_usdc_variants(self, amount: int, slippage_percent: float = 0.5) -> dict:
+        """
+        Swap USDC.e to USDC using Quickswap
+        
+        Args:
+            amount: Amount in base units (6 decimals)
+            slippage_percent: Maximum acceptable slippage (default 0.5%)
+            
+        Returns:
+            dict: Transaction details including hash and amounts
+        """
+        try:
+            logger.info(f"Initiating USDC.e to USDC swap for {amount} units")
+            
+            # Define token addresses
+            usdc_e = Web3.to_checksum_address(USDC_ADDRESS)  # Your USDC.e address
+            usdc = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")  # Native USDC
+            
+            # Check USDC.e balance
+            usdc_e_balance = self.usdc.functions.balanceOf(self.wallet_address).call()
+            if usdc_e_balance < amount:
+                raise ValueError(f"Insufficient USDC.e balance. Have: {usdc_e_balance}, Need: {amount}")
+
+            # Get quote from router
+            path = [usdc_e, usdc]
+            try:
+                amounts = self.router.functions.getAmountsOut(amount, path).call()
+                expected_output = amounts[1]
+                
+                # Calculate minimum output with slippage
+                min_output = int(expected_output * (1 - slippage_percent / 100))
+                
+                logger.info(f"""
+                Swap Quote:
+                Input: {amount} USDC.e
+                Expected Output: {expected_output} USDC
+                Minimum Output: {min_output} USDC
+                Slippage: {slippage_percent}%
+                """)
+            except Exception as e:
+                raise ValueError(f"Failed to get swap quote: {str(e)}")
+
+            # Check and handle approval
+            try:
+                await self.approve_token(
+                    token_contract=self.usdc,
+                    spender_address=self.QUICKSWAP_ROUTER,
+                    amount=amount
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to approve USDC.e: {str(e)}")
+
+            # Build swap transaction
+            deadline = int(time.time()) + 1200  # 20 minutes
+            
+            # Get current gas prices
+            base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
+            priority_fee = 50_000_000_000  # 50 gwei
+            max_fee = base_fee * 4 + priority_fee
+
+            swap_txn = self.router.functions.swapExactTokensForTokens(
+                amount,
+                min_output,
+                path,
+                self.wallet_address,
+                deadline
+            ).build_transaction({
+                'chainId': 137,
+                'gas': 300000,  # Appropriate gas limit for swaps
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                'from': self.wallet_address
+            })
+
+            # Sign and send transaction
+            signed_txn = self.w3.eth.account.sign_transaction(swap_txn, PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            
+            logger.info(f"Swap transaction sent: {tx_hash.hex()}")
+            
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+            
+            if receipt['status'] != 1:
+                raise ValueError("Swap transaction failed")
+
+            # Verify the swap result
+            final_usdc_balance = self.bridge_usdc.functions.balanceOf(self.wallet_address).call()
+            
+            return {
+                "success": True,
+                "transaction_hash": receipt['transactionHash'].hex(),
+                "gas_used": receipt['gasUsed'],
+                "input_amount": amount,
+                "expected_output": expected_output,
+                "minimum_output": min_output,
+                "final_usdc_balance": final_usdc_balance
+            }
+            
+        except Exception as e:
+            logger.error(f"USDC swap failed: {str(e)}")
+            raise ValueError(f"Failed to swap USDC: {str(e)}")
+        
+    async def get_swap_quote(self, amount: int) -> dict:
+        """
+        Get quote for USDC.e to USDC swap across different paths
+        
+        Args:
+            amount: Amount in USDC.e base units (6 decimals)
+            
+        Returns:
+            dict: Quote information including different paths and their rates
+        """
+        try:
+            # Define token addresses
+            usdc_e = Web3.to_checksum_address(USDC_ADDRESS)  # Your USDC.e address
+            usdc = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")  # Native USDC
+            usdt = Web3.to_checksum_address("0xc2132D05D31c914a87C6611C10748AEb04B58e8F")  # Polygon USDT
+
+            quotes = {}
+            
+            # Get direct path quote (USDC.e -> USDC)
+            try:
+                direct_amounts = self.router.functions.getAmountsOut(
+                    amount,
+                    [usdc_e, usdc]
+                ).call()
+                
+                quotes["direct"] = {
+                    "path": ["USDC.e", "USDC"],
+                    "input_amount": amount,
+                    "output_amount": direct_amounts[1],
+                    "rate": direct_amounts[1] / amount,
+                    "price_impact_percent": ((1 - (direct_amounts[1] / amount)) * 100)
+                }
+            except Exception as e:
+                logger.warning(f"Failed to get direct path quote: {str(e)}")
+                quotes["direct"] = {"error": str(e)}
+
+            # Get quote through USDT (USDC.e -> USDT -> USDC)
+            try:
+                indirect_amounts = self.router.functions.getAmountsOut(
+                    amount,
+                    [usdc_e, usdt, usdc]
+                ).call()
+                
+                quotes["via_usdt"] = {
+                    "path": ["USDC.e", "USDT", "USDC"],
+                    "input_amount": amount,
+                    "output_amount": indirect_amounts[2],
+                    "rate": indirect_amounts[2] / amount,
+                    "price_impact_percent": ((1 - (indirect_amounts[2] / amount)) * 100)
+                }
+            except Exception as e:
+                logger.warning(f"Failed to get USDT path quote: {str(e)}")
+                quotes["via_usdt"] = {"error": str(e)}
+
+            # Find best route
+            valid_quotes = {
+                path: data for path, data in quotes.items() 
+                if "error" not in data
+            }
+            
+            if not valid_quotes:
+                raise ValueError("No valid swap routes found")
+                
+            best_route = max(
+                valid_quotes.items(),
+                key=lambda x: x[1]["output_amount"]
+            )
+            
+            return {
+                "quotes": quotes,
+                "best_route": {
+                    "path": best_route[0],
+                    "details": best_route[1]
+                },
+                "input_token": {
+                    "symbol": "USDC.e",
+                    "address": usdc_e,
+                    "amount": amount,
+                    "amount_readable": amount / 1_000_000
+                },
+                "recommended_slippage": 0.5,  # Base slippage recommendation
+                "timestamp": int(time.time())
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get swap quotes: {str(e)}")
+            raise ValueError(f"Quote fetching failed: {str(e)}")
+
+    async def execute_swap(self, amount: int, slippage_percent: float = 0.5) -> dict:
+        """
+        Execute USDC.e to USDC swap with enhanced debugging and timeout handling
+        """
+        try:
+            logger.info("=== Starting Swap Execution ===")
+            logger.info(f"Input: {amount} USDC.e units ({amount/1_000_000} USDC.e)")
+            
+            # Step 1: Get quotes and determine best route
+            logger.info("Step 1: Fetching quotes...")
+            quotes = await self.get_swap_quote(amount)
+            if not quotes["quotes"]:
+                raise ValueError("No valid swap routes available")
+                
+            best_route = quotes["best_route"]
+            route_details = best_route["details"]
+            logger.info(f"Selected route: {best_route['path']}")
+            logger.info(f"Expected price impact: {route_details['price_impact_percent']}%")
+            
+            # Step 2: Set up swap parameters
+            logger.info("Step 2: Setting up swap parameters...")
+            usdc_e = Web3.to_checksum_address(USDC_ADDRESS)
+            usdc = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
+            usdt = Web3.to_checksum_address("0xc2132D05D31c914a87C6611C10748AEb04B58e8F")
+            
+            path = (
+                [usdc_e, usdt, usdc] 
+                if best_route["path"] == "via_usdt" 
+                else [usdc_e, usdc]
+            )
+            logger.info(f"Path: {' -> '.join([addr[:6] + '...' + addr[-4:] for addr in path])}")
+            
+            # Step 3: Check current balances
+            logger.info("Step 3: Checking balances...")
+            initial_usdc_e_balance = self.usdc.functions.balanceOf(self.wallet_address).call()
+            logger.info(f"Initial USDC.e balance: {initial_usdc_e_balance/1_000_000}")
+            
+            if initial_usdc_e_balance < amount:
+                raise ValueError(f"Insufficient USDC.e balance. Have: {initial_usdc_e_balance/1_000_000}, Need: {amount/1_000_000}")
+            
+            # Step 4: Calculate minimum output with slippage
+            expected_output = route_details["output_amount"]
+            min_output = int(expected_output * (1 - slippage_percent / 100))
+            logger.info(f"Expected output: {expected_output/1_000_000} USDC")
+            logger.info(f"Minimum output: {min_output/1_000_000} USDC")
+            
+            # Step 5: Handle approval with timeout
+            logger.info("Step 5: Checking and handling approval...")
+            try:
+                async with asyncio.timeout(30):  # 30 second timeout for approval
+                    current_allowance = self.usdc.functions.allowance(
+                        self.wallet_address,
+                        self.QUICKSWAP_ROUTER
+                    ).call()
+                    logger.info(f"Current allowance: {current_allowance/1_000_000} USDC.e")
+                    
+                    if current_allowance < amount:
+                        logger.info("Insufficient allowance, initiating approval...")
+                        await self.approve_token(
+                            token_contract=self.usdc,
+                            spender_address=self.QUICKSWAP_ROUTER,
+                            amount=amount
+                        )
+                        logger.info("Approval completed")
+                    else:
+                        logger.info("Sufficient allowance exists")
+            except asyncio.TimeoutError:
+                raise ValueError("Approval process timed out after 30 seconds")
+            
+            # Step 6: Build swap transaction with aggressive gas settings
+            logger.info("Step 6: Building swap transaction...")
+            deadline = int(time.time()) + 300  # Reduced to 5 minutes
+            base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
+            priority_fee = 100_000_000_000  # Increased to 100 gwei for faster inclusion
+            max_fee = base_fee * 5 + priority_fee  # Increased multiplier
+            
+            swap_txn = self.router.functions.swapExactTokensForTokens(
+                amount,
+                min_output,
+                path,
+                self.wallet_address,
+                deadline
+            ).build_transaction({
+                'chainId': 137,
+                'gas': 300000,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                'from': self.wallet_address
+            })
+            
+            # Step 7: Execute transaction with timeout
+            logger.info("Step 7: Executing swap transaction...")
+            try:
+                async with asyncio.timeout(60):  # 60 second timeout for transaction
+                    signed_txn = self.w3.eth.account.sign_transaction(swap_txn, PRIVATE_KEY)
+                    tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+                    logger.info(f"Transaction sent: {tx_hash.hex()}")
+                    
+                    # Wait for receipt with progress logging
+                    start_time = time.time()
+                    while True:
+                        try:
+                            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+                            if receipt is not None:
+                                break
+                        except Exception:
+                            if time.time() - start_time > 45:  # Log every 45 seconds
+                                logger.info("Still waiting for transaction receipt...")
+                        await asyncio.sleep(3)
+                    
+                    if receipt['status'] != 1:
+                        raise ValueError("Swap transaction failed")
+                    logger.info("Transaction confirmed successfully")
+                    
+            except asyncio.TimeoutError:
+                raise ValueError("Transaction execution timed out after 60 seconds")
+            
+            # Step 8: Verify final balance
+            logger.info("Step 8: Verifying final balance...")
+            native_usdc = self.w3.eth.contract(
+                address=usdc,
+                abi=USDC_ABI
+            )
+            final_usdc_balance = native_usdc.functions.balanceOf(self.wallet_address).call()
+            logger.info(f"Final USDC balance: {final_usdc_balance/1_000_000}")
+            
+            return {
+                "success": True,
+                "transaction_hash": receipt['transactionHash'].hex(),
+                "gas_used": receipt['gasUsed'],
+                "route_used": {
+                    "path": route_details['path'],
+                    "price_impact": route_details['price_impact_percent']
+                },
+                "amounts": {
+                    "input": {
+                        "base_units": amount,
+                        "usdc": amount / 1_000_000
+                    },
+                    "output": {
+                        "expected": {
+                            "base_units": expected_output,
+                            "usdc": expected_output / 1_000_000
+                        },
+                        "minimum": {
+                            "base_units": min_output,
+                            "usdc": min_output / 1_000_000
+                        },
+                        "actual": {
+                            "base_units": final_usdc_balance,
+                            "usdc": final_usdc_balance / 1_000_000
+                        }
+                    }
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Swap execution failed: {str(e)}")
+            raise ValueError(f"Failed to execute swap: {str(e)}")
