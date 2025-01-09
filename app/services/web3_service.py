@@ -165,13 +165,54 @@ class Web3Service:
             logger.error(f"USDC approval failed: {str(e)}")
             raise ValueError(f"Failed to approve USDC: {str(e)}")
 
+    async def check_and_approve_trading(self, token_address: str, spender_address: str, amount: int) -> bool:
+        """
+        Check and approve token spending specifically for trading operations.
+        Returns True if approval is already sufficient or was successfully granted.
+        """
+        try:
+            # Get token contract
+            token_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=USDC_ABI  # Using USDC ABI since it's a standard ERC20
+            )
+            
+            # Check current allowance
+            current_allowance = token_contract.functions.allowance(
+                self.wallet_address,
+                Web3.to_checksum_address(spender_address)
+            ).call()
+            
+            logger.info(f"""
+                Trading Approval Check:
+                Token: {token_address}
+                Spender: {spender_address}
+                Current Allowance: {current_allowance}
+                Required Amount: {amount}
+            """)
+            
+            # If allowance is sufficient, return early
+            if current_allowance >= amount:
+                logger.info("Existing allowance is sufficient")
+                return True
+                
+            # Need to approve - use existing approve_token method with retry logic
+            approval_result = await self.approve_token(
+                token_contract=token_contract,
+                spender_address=spender_address,
+                amount=amount
+            )
+            
+            return approval_result.get('success', False)
+            
+        except Exception as e:
+            logger.error(f"Trading approval check failed: {str(e)}")
+            raise ValueError(f"Failed to check/approve for trading: {str(e)}")
+
     async def approve_all_contracts(self):
         """
         Approve all required contracts for both USDC and CTF tokens.
         Implements approval checks and handles both ERC20 (USDC) and ERC1155 (CTF) approvals.
-        
-        Returns:
-            dict: Status of approval process with success flag and any error details
         """
         try:
             logger.info("Starting approval process for all contracts...")
@@ -182,7 +223,7 @@ class Web3Service:
                     checksum_address = self.w3.to_checksum_address(address)
                     logger.info(f"Processing approvals for {name} at {checksum_address}")
 
-                    # Step 1: Check current approval states
+                    # Step 1: Get initial approval states
                     current_approvals = {
                         "usdc": self.usdc.functions.allowance(
                             self.wallet_address,
@@ -196,21 +237,20 @@ class Web3Service:
 
                     logger.info(f"Current approvals for {name}: USDC={current_approvals['usdc']}, CTF={current_approvals['ctf']}")
 
-                    # Step 2: Handle CTF (ERC1155) approval first
+                    # Step 2: Handle CTF (ERC1155) approval if needed
                     if not current_approvals['ctf']:
                         logger.info(f"Setting CTF approval for {name}")
                         
-                        # Get current gas prices
                         base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
                         priority_fee = 50_000_000_000  # 50 gwei
-                        max_fee = base_fee * 4 + priority_fee  # 4x multiplier for quick inclusion
+                        max_fee = base_fee * 4 + priority_fee
 
                         ctf_txn = self.ctf.functions.setApprovalForAll(
                             checksum_address,
                             True
                         ).build_transaction({
-                            'chainId': 137,  # Polygon mainnet
-                            'gas': 150000,   # Higher gas limit for CTF approval
+                            'chainId': 137,
+                            'gas': 150000,
                             'maxFeePerGas': max_fee,
                             'maxPriorityFeePerGas': priority_fee,
                             'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
@@ -227,7 +267,7 @@ class Web3Service:
                             raise ValueError(f"CTF approval transaction failed for {name}")
                         
                         logger.info(f"CTF approval successful for {name}")
-                        await asyncio.sleep(2)  # Wait for approval to propagate
+                        await asyncio.sleep(5)  # Increased wait time for state propagation
                     else:
                         logger.info(f"CTF already approved for {name}")
 
@@ -235,17 +275,36 @@ class Web3Service:
                     if current_approvals['usdc'] < MAX_UINT256:
                         logger.info(f"Setting USDC approval for {name}")
                         
-                        # Reuse the same gas price calculation
                         base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
                         priority_fee = 50_000_000_000  # 50 gwei
                         max_fee = base_fee * 4 + priority_fee
 
+                        # First reset allowance if it's not zero
+                        if current_approvals['usdc'] > 0:
+                            reset_txn = self.usdc.functions.approve(
+                                checksum_address,
+                                0
+                            ).build_transaction({
+                                'chainId': 137,
+                                'gas': 100000,
+                                'maxFeePerGas': max_fee,
+                                'maxPriorityFeePerGas': priority_fee,
+                                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                                'from': self.wallet_address
+                            })
+
+                            signed_reset = self.w3.eth.account.sign_transaction(reset_txn, PRIVATE_KEY)
+                            reset_hash = self.w3.eth.send_raw_transaction(signed_reset.raw_transaction)
+                            await self.w3.eth.wait_for_transaction_receipt(reset_hash, timeout=180)
+                            await asyncio.sleep(5)  # Wait for reset to propagate
+
+                        # Now set new approval
                         usdc_txn = self.usdc.functions.approve(
                             checksum_address,
                             MAX_UINT256
                         ).build_transaction({
                             'chainId': 137,
-                            'gas': 100000,  # Standard gas limit for ERC20 approval
+                            'gas': 100000,
                             'maxFeePerGas': max_fee,
                             'maxPriorityFeePerGas': priority_fee,
                             'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
@@ -262,26 +321,32 @@ class Web3Service:
                             raise ValueError(f"USDC approval transaction failed for {name}")
                         
                         logger.info(f"USDC approval successful for {name}")
-                        await asyncio.sleep(2)  # Wait for approval to propagate
+                        await asyncio.sleep(5)  # Increased wait time for state propagation
                     else:
                         logger.info(f"USDC already at max allowance for {name}")
 
-                    # Verify final approval states
-                    final_approvals = {
-                        "usdc": self.usdc.functions.allowance(
-                            self.wallet_address,
-                            checksum_address
-                        ).call(),
-                        "ctf": self.ctf.functions.isApprovedForAll(
-                            self.wallet_address,
-                            checksum_address
-                        ).call()
-                    }
-                    
-                    if not final_approvals['ctf'] or final_approvals['usdc'] < MAX_UINT256:
-                        raise ValueError(f"Final approval verification failed for {name}")
-                    
-                    logger.info(f"All approvals successfully verified for {name}")
+                    # Step 4: Final verification with retries
+                    for retry in range(3):  # Try up to 3 times
+                        await asyncio.sleep(5)  # Wait between checks
+                        
+                        final_approvals = {
+                            "usdc": self.usdc.functions.allowance(
+                                self.wallet_address,
+                                checksum_address
+                            ).call(),
+                            "ctf": self.ctf.functions.isApprovedForAll(
+                                self.wallet_address,
+                                checksum_address
+                            ).call()
+                        }
+                        
+                        if final_approvals['ctf'] and final_approvals['usdc'] >= MAX_UINT256:
+                            logger.info(f"Final approvals verified for {name}")
+                            break
+                        elif retry == 2:  # Last attempt failed
+                            raise ValueError(f"Final approval verification failed for {name}")
+                        else:
+                            logger.info(f"Approval verification attempt {retry + 1} failed, retrying...")
 
                 except Exception as e:
                     logger.error(f"Approval process failed for {name}: {str(e)}")

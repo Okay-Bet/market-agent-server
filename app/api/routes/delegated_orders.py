@@ -24,13 +24,38 @@ async def submit_delegated_order(order: OrderRequest):
         
         # Convert the incoming raw amount to decimal USDC
         decimal_amount = float(order.amount) / 1_000_000
+        
         logger.info(f"""
-        Order Processing:
-        Raw USDC amount: {order.amount}
-        Decimal USDC amount: {decimal_amount}
-        Price: {order.price}
+            Order Processing:
+            Raw USDC amount: {order.amount}
+            Decimal USDC amount: {decimal_amount}
+            Price: {order.price}
         """)
         
+        # First check all current approvals
+        try:
+            current_approvals = web3_service.check_all_approvals()
+            logger.info(f"Current contract approvals: {current_approvals}")
+            
+            # If any required approvals are missing, approve all contracts
+            needs_approval = any(
+                not approval['ctf_approved'] or approval['usdc_allowance'] == 0
+                for approval in current_approvals.values()
+            )
+            
+            if needs_approval:
+                logger.info("Missing approvals detected, initiating approval process...")
+                approval_result = await web3_service.approve_all_contracts()
+                if not approval_result['success']:
+                    raise ValueError(f"Contract approval failed: {approval_result.get('error')}")
+                logger.info("All contracts successfully approved")
+            else:
+                logger.info("All required approvals are already in place")
+                
+        except Exception as e:
+            logger.error(f"Failed to handle approvals: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Approval process failed: {str(e)}")
+
         # Execute trade with the exact amount received
         try:
             logger.info(f"Executing trade for user: {order.user_address}")
@@ -47,6 +72,7 @@ async def submit_delegated_order(order: OrderRequest):
                 raise ValueError("Trade execution failed")
                 
             logger.info(f"Trade execution result: {result}")
+            
             return JSONResponse(content={
                 "success": True,
                 "status": "completed",
