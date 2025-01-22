@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import logging
 from sqlalchemy import text
-# Fix imports to use relative paths
 from .api.routes.health import router as health_router
 from .api.routes.status import router as status_router
 from .api.routes.positions import router as positions_router
@@ -30,7 +29,7 @@ postgres_service = PostgresService()
 market_resolution_service = MarketResolutionService(web3_service, postgres_service)
 
 # Initialize FastAPI app
-app = FastAPI(title="Polymarket Trading Server")
+app = FastAPI(title="Market Agent Server")
 
 # Configure CORS
 app.add_middleware(
@@ -77,7 +76,6 @@ async def startup_event():
                 ADD COLUMN IF NOT EXISTS order_id varchar(66);
             """))
 
-            # Commit all changes
             conn.commit()
 
     except Exception as e:
