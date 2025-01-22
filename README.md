@@ -1,5 +1,13 @@
-# polymarket-clob-server
-proxy server in python to allow users to make prediction market positions. 
+# Market Agent Sever
+
+Prediction markets should be available to everyone. Use this agent to place orders and manage positions on your behalf.  
+
+## How it works:
+
+- FastAPI - python server for letting user open positons
+- Local Postgres Server - tracking positions
+- Keygen - Use a private mnemonic to cycle through addresses
+- VPN management  
 
 
 ## Getting Started
